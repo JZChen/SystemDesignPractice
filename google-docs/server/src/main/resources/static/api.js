@@ -7,12 +7,25 @@ const API_BASE = window.location.origin.includes(':5173')
   ? 'http://localhost:8080/api'
   : '/api';
 
+/**
+ * fetch() wrapper: a TypeError means the request never reached the server (down / network).
+ * Report it so the "Server is down" screen appears right away, then rethrow for the caller.
+ */
+async function apiFetch(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch (err) {
+    if (window.ServerStatus) window.ServerStatus.reportProblem();
+    throw err;
+  }
+}
+
 const Api = {
   /**
    * API 1: Creates a new document and receives shareable URL + session token.
    */
   async createDocument(title, engineType = 'OT') {
-    const res = await fetch(`${API_BASE}/documents`, {
+    const res = await apiFetch(`${API_BASE}/documents`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title, engineType })
@@ -32,7 +45,7 @@ const Api = {
     if (sessionId) {
       headers['X-Session-Id'] = sessionId;
     }
-    const res = await fetch(`${API_BASE}/documents/${encodeURIComponent(docId)}`, {
+    const res = await apiFetch(`${API_BASE}/documents/${encodeURIComponent(docId)}`, {
       method: 'GET',
       headers
     });
@@ -61,7 +74,7 @@ const Api = {
           text: text || '',
           length: Number(length || 0)
         };
-    const res = await fetch(`${API_BASE}/documents/${encodeURIComponent(docId)}/operations`, {
+    const res = await apiFetch(`${API_BASE}/documents/${encodeURIComponent(docId)}/operations`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -80,7 +93,7 @@ const Api = {
    * Catch-up endpoint: retrieves operation log since revision.
    */
   async getOperationsSince(docId, sinceRevision = 0) {
-    const res = await fetch(`${API_BASE}/documents/${encodeURIComponent(docId)}/operations?sinceRevision=${sinceRevision}`);
+    const res = await apiFetch(`${API_BASE}/documents/${encodeURIComponent(docId)}/operations?sinceRevision=${sinceRevision}`);
     if (!res.ok) return [];
     return res.json();
   }

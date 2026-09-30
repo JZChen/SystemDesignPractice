@@ -38,6 +38,7 @@ class SyncStream {
       });
 
       this.eventSource.onerror = () => {
+        if (window.ServerStatus) window.ServerStatus.reportProblem();
         if (this.callbacks.onError) {
           this.callbacks.onError();
         }

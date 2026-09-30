@@ -137,6 +137,17 @@ buffer:   -</pre>
     <!-- Toast Notification Banner -->
     <div id="toastNotification" class="toast-notification hidden"></div>
 
+    <!-- Server Down Screen (shown by server-status.js when /api/health stops answering) -->
+    <div id="serverDownOverlay" class="server-down-overlay hidden" role="alertdialog" aria-live="assertive" aria-labelledby="serverDownTitle">
+      <div class="server-down-card">
+        <div class="server-down-icon" aria-hidden="true">&#9888;</div>
+        <h2 id="serverDownTitle">Server is down</h2>
+        <p>The collaboration server is not responding. Edits made now will not be saved.</p>
+        <p id="serverDownDetail" class="server-down-detail">Retrying…</p>
+        <button type="button" id="btnServerRetry" class="btn btn-primary">Retry now</button>
+      </div>
+    </div>
+
     <!-- Create Document Modal Dialog -->
     <div id="modalBackdrop" class="modal-backdrop hidden">
       <div class="modal-card">
@@ -188,6 +199,7 @@ buffer:   -</pre>
 
   <!-- J2CL-compiled Java client core (ot-core + OtClient): exports window.OtClient -->
   <script src="/js/ot-client.js"></script>
+  <script src="/server-status.js"></script>
   <script src="/api.js"></script>
   <script src="/stream.js"></script>
   <script src="/app.js"></script>
