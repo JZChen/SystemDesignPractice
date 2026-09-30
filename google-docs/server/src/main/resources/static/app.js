@@ -9,12 +9,20 @@
 
   // State
   let currentDoc = null;
-  let currentSessionId = localStorage.getItem('google_docs_session_id') || null;
+  let currentSessionId = localStorage.getItem('google_docs_session_id') || null; // TODO(security): move to HttpOnly cookie + CSRF
   let currentRevision = 0;
   let syncStream = null;
   let isApplyingRemoteChange = false;
   let previousContent = '';
   let operationLog = [];
+
+  // J2CL client core (OT documents). The Java side owns the typing window, the ACK queue and
+  // remote-op merging; this file only renders, runs timers and talks to the network.
+  let otClient = null;
+  let flushTimer = null;
+  let composing = false;
+  let queuedServerEvents = [];
+  let resyncing = false;
 
   // DOM Elements
   const docTitleEl = document.getElementById('docTitle');
@@ -39,6 +47,8 @@
   const operationFeedListEl = document.getElementById('operationFeedList');
   const diagnosticStateViewEl = document.getElementById('diagnosticStateView');
   const opFeedCountEl = document.getElementById('opFeedCount');
+  const syncStateBadgeEl = document.getElementById('syncStateBadge');
+  const ackQueueViewEl = document.getElementById('ackQueueView');
 
   const modalBackdropEl = document.getElementById('modalBackdrop');
   const btnCloseModalEl = document.getElementById('btnCloseModal');

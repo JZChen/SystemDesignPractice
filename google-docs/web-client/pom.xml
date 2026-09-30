@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.googledocs</groupId>
+    <artifactId>web-client</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+    <name>web-client</name>
+    <description>
+        Browser client core: ot-core + a JsInterop facade, compiled to JavaScript with J2CL.
+        The optimized bundle is packaged into this jar at static/js/ot-client.js, so Spring Boot
+        serves it from classpath:/static/ with no extra configuration.
+    </description>
+
+    <properties>
+        <maven.compiler.release>11</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.googledocs</groupId>
+            <artifactId>ot-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.google.jsinterop</groupId>
+            <artifactId>jsinterop-annotations</artifactId>
+            <version>2.1.0</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+            <plugin>
+                <groupId>com.vertispan.j2cl</groupId>
+                <artifactId>j2cl-maven-plugin</artifactId>
+                <!-- 0.21.0: newest release mirrored by Corp Airlock (0.22.0 is not available there). -->
+                <version>0.21.0</version>
+                <executions>
+                    <execution>
+                        <id>j2cl-bundle</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>build</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <compilationLevel>ADVANCED_OPTIMIZATIONS</compilationLevel>
+                    <languageOut>ECMASCRIPT_2017</languageOut>
+                    <webappDirectory>${project.build.outputDirectory}/static/js</webappDirectory>
+                    <initialScriptFilename>ot-client.js</initialScriptFilename>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

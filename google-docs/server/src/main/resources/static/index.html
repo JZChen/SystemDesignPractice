@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="index.css">
+  <link rel="stylesheet" href="/index.css">
 </head>
 <body>
   <div id="app" class="app-container">
@@ -109,6 +109,15 @@
 
           <div class="inspector-card">
             <div class="card-header-row">
+              <h3>Client ACK Queue</h3>
+              <span id="syncStateBadge" class="badge badge-dim">Synchronized</span>
+            </div>
+            <pre id="ackQueueView" class="diagnostic-view">inflight: -
+buffer:   -</pre>
+          </div>
+
+          <div class="inspector-card">
+            <div class="card-header-row">
               <h3>Live Operation Feed</h3>
               <span id="opFeedCount" class="badge badge-dim">0 events</span>
             </div>
@@ -177,8 +186,10 @@
     </div>
   </div>
 
-  <script src="api.js"></script>
-  <script src="stream.js"></script>
-  <script src="app.js"></script>
+  <!-- J2CL-compiled Java client core (ot-core + OtClient): exports window.OtClient -->
+  <script src="/js/ot-client.js"></script>
+  <script src="/api.js"></script>
+  <script src="/stream.js"></script>
+  <script src="/app.js"></script>
 </body>
 </html>
