@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      Reactor aggregator. Build order:
+        ot-core    : shared OT logic (pure Java, runs on JVM and via J2CL in the browser)
+        web-client : J2CL compilation of the browser client core -> static/js/ot-client.js
+        server     : Spring Boot service (depends on ot-core + web-client)
+      The server keeps spring-boot-starter-parent as its own parent; this pom only orchestrates.
+    -->
+    <groupId>com.googledocs</groupId>
+    <artifactId>google-docs-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>google-docs-parent</name>
+
+    <modules>
+        <module>ot-core</module>
+        <module>web-client</module>
+        <module>server</module>
+    </modules>
+</project>
