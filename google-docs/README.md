@@ -1,221 +1,137 @@
-# Collaborative Google Docs System Design Prototype
+# Collaborative Google Docs Prototype
 
-A production-grade, educational prototype of **Google Docs** built for system design practice, featuring pluggable **Operational Transformation (OT)** and **Sequence CRDT (LSeq)** concurrency engines, and designed for **live multi-user global collaboration across the internet**.
+A Google Docs–style collaborative editor for system design practice: a Spring Boot server with pluggable **OT** and **CRDT** engines, real-time sync over **SSE**, and a browser client whose collaboration core (ACK queue, typing window) is written in **Java and compiled to JS with J2CL**.
 
----
-
-## 🏛 System Architecture
-
-```mermaid
-graph TD
-    subgraph Clients["Global Collaborators (Browsers)"]
-        ClientA["User A (NYC)<br/>Anonymous Penguin"]
-        ClientB["User B (London)<br/>Anonymous Cheetah"]
-        ClientC["User C (Tokyo)<br/>Anonymous Falcon"]
-    end
-
-    subgraph Internet["Public Internet / Tunnel"]
-        Tunnel["Cloudflare Tunnel / HTTPS Gateway"]
-    end
-
-    subgraph Server["Spring Boot 3 Concurrency Server (:8080)"]
-        API["REST Controllers<br/>(Create, Read, Mutate)"]
-        SSE["Server-Sent Events (SSE)<br/>Broadcast Service"]
-        
-        subgraph ConcurrencyLayer["Pluggable Concurrency Layer"]
-            EngineChoice{"CollaborativeEngine<br/>Strategy"}
-            OT["Handcrafted OT Engine<br/>• Revision History Log<br/>• T(Op1, Op2) Offset Shifting"]
-            CRDT["Handcrafted Sequence CRDT<br/>• Fractional LSeq Pos IDs<br/>• Tombstone Markers"]
-        end
-
-        Repo["In-Memory Concurrent Document Store<br/>ReentrantReadWriteLock"]
-    end
-
-    ClientA -->|"HTTPS / SSE"| Tunnel
-    ClientB -->|"HTTPS / SSE"| Tunnel
-    ClientC -->|"HTTPS / SSE"| Tunnel
-    Tunnel --> API
-    Tunnel <--> SSE
-    API --> EngineChoice
-    EngineChoice --> OT
-    EngineChoice --> CRDT
-    OT --> Repo
-    CRDT --> Repo
-    Repo -.->|"Push New Revision"| SSE
-```
+Full design, API specs, and current implementation status: [SYSTEM_DESIGN_PLAN.md](SYSTEM_DESIGN_PLAN.md).
 
 ---
 
-## 🔌 The 3 Core APIs
+## 1. Bring Up the Server & Client
 
-### 1. Create Document & Session
-- **Endpoint**: `POST /api/documents`
-- **Description**: Creates a new document, provisions a unique session token, and returns a shareable document URL.
-- **Request Body**:
-  ```json
-  {
-    "title": "Distributed Consensus Notes",
-    "engineType": "OT"
-  }
-  ```
-  *(Options for `engineType`: `"OT"` or `"CRDT"`)*
-- **Response (`201 Created`)**:
-  ```json
-  {
-    "docId": "8b51d6c8-f463-4709-b1d5-866ce9aa1e92",
-    "url": "/docs/8b51d6c8-f463-4709-b1d5-866ce9aa1e92",
-    "sessionId": "sess-a1b2c3d4-e5f6-7890",
-    "title": "Distributed Consensus Notes",
-    "engineType": "OT",
-    "content": "",
-    "revision": 0,
-    "user": {
-      "sessionId": "sess-a1b2c3d4-e5f6-7890",
-      "displayName": "Anonymous Penguin",
-      "color": "#3b82f6"
-    }
-  }
-  ```
-
-### 2. Read Document by URL / ID
-- **Endpoint**: `GET /api/documents/{docId}`
-- **Headers**: `X-Session-Id: sess-...` (optional; registers new peer if missing)
-- **Response (`200 OK`)**:
-  ```json
-  {
-    "docId": "8b51d6c8-f463-4709-b1d5-866ce9aa1e92",
-    "title": "Distributed Consensus Notes",
-    "engineType": "OT",
-    "content": "Paxos and Raft consensus algorithms...",
-    "revision": 4,
-    "activeUsers": [
-      { "sessionId": "sess-1", "displayName": "Anonymous Penguin", "color": "#3b82f6" },
-      { "sessionId": "sess-2", "displayName": "Anonymous Cheetah", "color": "#10b981" }
-    ]
-  }
-  ```
-
-### 3. Operations on the Document (Edit, Insert, Remove)
-- **Endpoint**: `POST /api/documents/{docId}/operations`
-- **Request Body**:
-  ```json
-  {
-    "sessionId": "sess-a1b2c3d4-e5f6-7890",
-    "baseRevision": 4,
-    "type": "INSERT",
-    "position": 5,
-    "text": " distributed",
-    "length": 0
-  }
-  ```
-- **Operation Types**:
-  - `INSERT`: Inserts `text` at character offset `position`.
-  - `DELETE`: Removes `length` characters starting at `position`.
-  - `REPLACE`: Replaces `length` characters at `position` with `text`.
-- **Response (`200 OK`)**:
-  ```json
-  {
-    "success": true,
-    "docId": "8b51d6c8-...",
-    "engineType": "OT",
-    "revision": 5,
-    "position": 5,
-    "text": " distributed",
-    "content": "Paxos distributed and Raft...",
-    "debugInfo": {
-      "engine": "OT",
-      "baseRevision": 4,
-      "committedRevision": 5,
-      "transformationsApplied": 0,
-      "finalPosition": 5
-    }
-  }
-  ```
-
----
-
-## ⚡ Concurrency Engines: OT vs. CRDT
-
-Users can toggle and compare both algorithms inside the UI using the **Concurrency Inspector**:
-
-### 1. Handcrafted Operational Transformation (OT)
-- **Concept**: A centralized server maintains an ordered log of committed operations $[Op_1, Op_2, \dots, Op_R]$.
-- **Transformation Pipeline**: When client operation $Op_{client}$ arrives with `baseRevision = B` where $B < R$, the server sequentially runs the transformation matrix:
-  $$Op' = T(Op, Op_i) \quad \forall i \in [B+1, R]$$
-- **Transformation Functions**:
-  - `INSERT vs INSERT`: Shifts position forward if incoming position is after applied position; deterministic session tie-breaking if equal.
-  - `INSERT vs DELETE`: Shifts backward by deleted length if incoming position is after deleted range.
-  - `DELETE vs DELETE`: Computes interval overlaps and subtracts already deleted characters.
-
-### 2. Handcrafted Sequence CRDT (Fractional LSeq)
-- **Concept**: Each character is assigned an immutable, totally ordered fractional identifier:
-  $$\text{CharID} = \langle \text{fractionalPosition}: [n_1, n_2, \dots], \text{siteId}, \text{clock} \rangle$$
-- **Insertion**: Allocates a fractional index strictly between neighbors (e.g. between `[32]` and `[48]` $\to$ `[40]`). Deepens tree if adjacent (`[32]` and `[33]` $\to$ `[32, 16]`).
-- **Deletion**: Marked with **Tombstones** (`deleted = true`), preserving total ordering and causality.
-- **Commutativity**: Operations can arrive out of order across the globe and deterministically converge to the exact same text.
-
----
-
-## 🚀 Running Locally
+There is **no separate client process**. The Spring Boot server serves the browser client as static files, so starting the server starts everything.
 
 ### Prerequisites
-- Java 21 (`/opt/homebrew/opt/openjdk@21` or any JDK 21+)
+- JDK 21: `/opt/homebrew/opt/openjdk@21` (on corp Macs the default `java` is blocked by Santa)
 - Maven 3.9+
 
-### Start the Service
+### Start (option A: one command)
 ```bash
-# Using the global runner script:
-./run-global-demo.sh
-
-# Or directly with Maven:
-cd server
-export JAVA_HOME="/opt/homebrew/opt/openjdk@21"
-mvn spring-boot:run
+./run-global-demo.sh              # port 8080; use SERVER_PORT=8081 ./run-global-demo.sh to change it
 ```
 
-Open your browser to: **[http://localhost:8080/](http://localhost:8080/)**
+### Start (option B: step by step)
+Run from this directory (`google-docs/`):
+```bash
+export JAVA_HOME=/opt/homebrew/opt/openjdk@21
+
+# 1. Install the shared OT library the server depends on (re-run whenever ot-core/ changes)
+mvn -B -pl ot-core install -DskipTests
+
+# 2. Start the server (foreground; Ctrl+C stops it)
+mvn -B -f server/pom.xml spring-boot:run \
+  -Dspring-boot.run.arguments="--server.address=127.0.0.1 --server.port=8080"
+```
+
+### Open the client
+1. Browse to **http://127.0.0.1:8080/**. A new document is created and the URL changes to `/docs/<docId>`.
+2. To collaborate as a **second user**, open that `/docs/<docId>` URL in an **Incognito window**, or in another browser or Chrome profile. Tabs in the same profile share one identity (the `sessionId` in `localStorage`), so they count as the same user.
+
+### Stop / restart
+```bash
+lsof -ti tcp:8080 -sTCP:LISTEN | xargs kill   # stop (or Ctrl+C in the server terminal)
+# restart = stop, then run the start command again
+```
+- Documents are **in memory only**. A restart wipes them, and old `/docs/<id>` links open a fresh document.
+- Open tabs show a **"Server is down"** screen while the server is unreachable, and reload by themselves when it comes back.
+- Changes under `server/` (Java or `static/`) take effect after a restart plus a hard reload (`Cmd+Shift+R`).
+
+### Run the tests
+```bash
+export JAVA_HOME=/opt/homebrew/opt/openjdk@21
+mvn -B -pl ot-core install        # shared OT core
+mvn -B -f server/pom.xml test     # server engines, end-to-end OT convergence
+```
+
+### Share with friends (optional)
+```bash
+cloudflared tunnel --url http://localhost:8080   # prints a public https://xxxx.trycloudflare.com URL
+```
+
+> [!NOTE]
+> **Current limitations**
+> - The J2CL bundle (`web-client` → `ot-client.js`) can't be built yet: Corp Airlock is missing the `j2cl-maven-plugin` dependencies. Until it can, the browser runs the legacy JS sync path, and a root `mvn install` fails at `web-client`.
+> - `docker compose up` is currently broken: the image builds `server/` without `ot-core`.
+>
+> Details: [SYSTEM_DESIGN_PLAN.md › Implementation status](SYSTEM_DESIGN_PLAN.md#goal-description).
 
 ---
 
-## 🌐 Trying Out Globally with Friends
+## 2. High-Level Architecture
 
-You can share your live local instance with friends anywhere in the world in seconds:
+```mermaid
+graph LR
+    subgraph Browser["Browser (one per user)"]
+        UI["JS Renderer<br/>index.html · app.js<br/>(textarea, presence, inspector)"]
+        Core["J2CL Java Core · ot-client.js<br/>InputCoalescer → OperationDiff<br/>ClientSyncState (ACK queue)"]
+        Net["api.js (REST) · stream.js (SSE)<br/>server-status.js (health)"]
+        UI <--> Core
+        UI --> Net
+    end
 
-### Option 1: Cloudflare Tunnel (Zero-configuration HTTPS)
-```bash
-# Install cloudflared (if not already installed: brew install cloudflared)
-cloudflared tunnel --url http://localhost:8080
+    subgraph Server["Spring Boot 3 Server (:8080)"]
+        REST["REST Controllers<br/>documents · operations · health"]
+        DS["DocumentService<br/>per-doc ReadWriteLock"]
+        Engine{"CollaborativeEngine"}
+        OT["OtEngine<br/>revision log of TextOperations"]
+        CRDT["CrdtEngine<br/>fractional LSeq + tombstones"]
+        Store[("In-memory documents")]
+        BC["BroadcastService<br/>SSE fan-out in revision order"]
+        REST --> DS --> Engine
+        Engine --> OT
+        Engine --> CRDT
+        OT --> Store
+        CRDT --> Store
+        DS --> BC
+    end
+
+    Shared[["ot-core (shared Java)<br/>TextOperation: apply · compose · transform"]]
+
+    Net -- "POST /operations {ops, baseRevision, clientOpId}" --> REST
+    BC -- "SSE: ops, revision, clientOpId (= ACK for the author)" --> Net
+    Shared -. "JVM" .-> OT
+    Shared -. "compiled by J2CL" .-> Core
 ```
-This prints a public HTTPS link: `https://xxxx.trycloudflare.com`
-Send this link to friends. When they open it, they receive unique anonymous personas (e.g. "Anonymous Falcon") and can edit concurrently with you!
 
-### Option 2: Docker Compose
-```bash
-docker compose up --build
+### How an edit flows
+```mermaid
+sequenceDiagram
+    participant A as Browser A
+    participant S as Server (OtEngine)
+    participant B as Browser B
+    A->>A: typing window (80 ms idle / 400 ms max) → op
+    A->>S: POST ops @ baseRevision=5, clientOpId=a-1
+    B->>S: POST ops @ baseRevision=5 (concurrent)
+    S->>S: lock doc · commit A as rev 6
+    S-->>A: SSE rev 6 (own clientOpId → ACK)
+    S-->>B: SSE rev 6 (remote → transform vs in-flight op, render)
+    S->>S: transform B against rev 6 · commit as rev 7
+    S-->>A: SSE rev 7 (remote)
+    S-->>B: SSE rev 7 (ACK)
 ```
-Deploys the containerized application on port 8080, ready for deployment to any VPS, AWS ECS, GCP Cloud Run, or Fly.io.
+
+- **Server**: accepts concurrent edits and applies them one at a time per document. Any edit based on an older revision is transformed against the newer history. Every commit is broadcast over SSE in revision order.
+- **Client**: keeps at most one op in flight and batches later typing into a buffer. Remote ops are transformed through the in-flight op and the buffer, so local keystrokes are never overwritten. This is the Jupiter / Google Wave ACK queue.
+- **Shared code**: the server and the browser run the same `transform` from `ot-core`, on the JVM and via J2CL respectively.
 
 ---
 
-## 🔒 Security Hardening
-
-- **Rate Limiting**: In-memory token bucket filter limits requests to 600 req/min per IP/session (prevents flooding).
-- **Payload Clamping**: Maximum operation text size capped at 32 KB; maximum document buffer capped at 2 MB (DoS prevention).
-- **XSS Prevention**: Frontend strictly binds untrusted document text via React DOM / native element values; zero `innerHTML` execution.
-- **Security Headers**: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, and strict CSP policy.
-
----
-
-## 🧪 Verification & Test Suite
-
-Run the full automated test suite:
-```bash
-cd server
-export JAVA_HOME="/opt/homebrew/opt/openjdk@21"
-mvn test
+## Project Layout
 ```
-
-### Tests Included:
-1. `OtEngineTest`: Non-overlapping/overlapping inserts, boundary shifts on delete, and overlapping delete range clipping.
-2. `CrdtEngineTest`: Fractional position allocation, out-of-order commutativity, and tombstone preservation.
-3. `DocumentServiceTest`: Lifecycle creation, session allocation, and 10-thread simultaneous concurrent stress test.
+google-docs/
+├── pom.xml              # Maven aggregator: ot-core → web-client → server
+├── ot-core/             # Shared OT logic (TextOperation, ACK queue, typing window) + tests
+├── web-client/          # J2CL facade (OtClient) → static/js/ot-client.js
+├── server/              # Spring Boot app; serves the client from src/main/resources/static/
+├── run-global-demo.sh   # Install ot-core, start server, print tunnel instructions
+└── SYSTEM_DESIGN_PLAN.md
+```

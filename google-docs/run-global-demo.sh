@@ -17,6 +17,11 @@ echo "=================================================================="
 export JAVA_HOME="/opt/homebrew/opt/openjdk@21"
 export PATH="/opt/homebrew/opt/openjdk@21/bin:/opt/homebrew/bin:$PATH"
 
+# The server depends on the shared ot-core module; install it into ~/.m2 first.
+# (A full root build also needs web-client, which is blocked on J2CL artifacts in Airlock.)
+echo "📦 Installing shared ot-core module..."
+(cd "$DIR" && mvn -B -q -pl ot-core install -DskipTests)
+
 # Run Spring Boot service
 cd "$DIR/server"
 echo "📦 Building & launching Spring Boot application..."
@@ -32,7 +37,7 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 echo "⏳ Waiting for service to respond on http://127.0.0.1:$PORT..."
-while ! curl -s "http://127.0.0.1:$PORT/api/documents" -X POST -H "Content-Type: application/json" -d '{"title":"Health Check"}' > /dev/null; do
+while ! curl -sf "http://127.0.0.1:$PORT/api/health" > /dev/null; do
     sleep 1
 done
 
