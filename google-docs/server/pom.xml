@@ -32,6 +32,13 @@
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
+        <!-- Shared OT core (TextOperation transform/compose), also compiled to JS for the browser -->
+        <dependency>
+            <groupId>com.googledocs</groupId>
+            <artifactId>ot-core</artifactId>
+            <version>1.0.0-SNAPSHOT</version>
+        </dependency>
+
         <!-- Spring Boot Starter Test for JUnit 5 & MockMvc -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

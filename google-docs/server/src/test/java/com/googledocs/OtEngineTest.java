@@ -5,6 +5,9 @@ import com.googledocs.service.OtEngine;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.web.server.ResponseStatusException;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -99,5 +102,60 @@ class OtEngineTest {
         OperationResult res2 = otEngine.applyOperation(doc, op2);
 
         assertEquals("01789", res2.getContent());
+    }
+
+    @Test
+    @DisplayName("Insert inside a concurrently deleted range survives in both arrival orders")
+    void testInsertInsideDeleteConvergesBothOrders() {
+        // Order 1: delete committed first, then the concurrent insert
+        Document d1 = new Document("doc-1", "Test", EngineType.OT);
+        d1.getContentBuffer().append("0123456789");
+        otEngine.applyOperation(d1, new OperationRequest("sess-A", 0, OperationType.DELETE, 2, "", 6));
+        otEngine.applyOperation(d1, new OperationRequest("sess-B", 0, OperationType.INSERT, 5, "X", 0));
+
+        // Order 2: insert committed first, then the concurrent delete
+        Document d2 = new Document("doc-2", "Test", EngineType.OT);
+        d2.getContentBuffer().append("0123456789");
+        otEngine.applyOperation(d2, new OperationRequest("sess-B", 0, OperationType.INSERT, 5, "X", 0));
+        otEngine.applyOperation(d2, new OperationRequest("sess-A", 0, OperationType.DELETE, 2, "", 6));
+
+        assertEquals("01X89", d1.getContent());
+        assertEquals(d1.getContent(), d2.getContent());
+    }
+
+    @Test
+    @DisplayName("TextOperation request with clientOpId is applied and echoed")
+    void testOpsRequest() {
+        Document doc = new Document("doc-1", "Test", EngineType.OT);
+        doc.getContentBuffer().append("Hello World");
+
+        OperationResult res = otEngine.applyOperation(doc,
+            OperationRequest.ofOps("sess-A", 0, List.of(6, "Brave ", 5), "c-1"));
+
+        assertEquals("Hello Brave World", res.getContent());
+        assertEquals("c-1", res.getClientOpId());
+        assertEquals(List.of(6, "Brave ", 5), res.getOps());
+        assertEquals(OperationType.INSERT, res.getType());
+        assertEquals(6, res.getPosition());
+        assertEquals("c-1", doc.getOtHistory().get(0).getClientOpId());
+    }
+
+    @Test
+    @DisplayName("Rejects base revision ahead of server, base length mismatch and malformed ops")
+    void testValidation() {
+        Document doc = new Document("doc-1", "Test", EngineType.OT);
+        doc.getContentBuffer().append("abc");
+
+        assertThrows(ResponseStatusException.class, () -> otEngine.applyOperation(doc,
+            OperationRequest.ofOps("sess-A", 5, List.of(3, "x"), "c-1")));
+        assertThrows(ResponseStatusException.class, () -> otEngine.applyOperation(doc,
+            OperationRequest.ofOps("sess-A", 0, List.of(10, "x"), "c-2")));
+        assertThrows(ResponseStatusException.class, () -> otEngine.applyOperation(doc,
+            OperationRequest.ofOps("sess-A", 0, List.of(1.5, "x"), "c-3")));
+        assertThrows(ResponseStatusException.class, () -> otEngine.applyOperation(doc,
+            OperationRequest.ofOps("sess-A", 0, List.of(3, true), "c-4")));
+
+        assertEquals("abc", doc.getContent());
+        assertEquals(0, doc.getRevision());
     }
 }

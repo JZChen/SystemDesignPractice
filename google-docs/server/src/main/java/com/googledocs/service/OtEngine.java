@@ -1,16 +1,27 @@
 package com.googledocs.service;
 
 import com.googledocs.model.*;
+import com.googledocs.ot.OtException;
+import com.googledocs.ot.TextOperation;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.util.*;
 
 /**
- * Handcrafted Operational Transformation (OT) Engine for real-time collaborative text editing.
- * Implements linear revision history tracking and character position transformation functions.
+ * Operational Transformation (OT) engine with a linear revision log.
+ *
+ * <p>Uses the shared {@code ot-core} {@link TextOperation} (retain / insert / delete), the exact same
+ * transform the J2CL browser client runs. An incoming op based on an older revision is transformed
+ * against every op committed since, always as the <em>first</em> operand, so insert tie-breaks match
+ * the client's ACK queue and TP1 convergence holds.
  */
 @Service
 public class OtEngine implements CollaborativeEngine {
+
+    static final int MAX_INSERT_CHARS = 32768;
+    private static final int MAX_TRACE_OP_CHARS = 120;
 
     @Override
     public EngineType getEngineType() {
@@ -20,212 +31,133 @@ public class OtEngine implements CollaborativeEngine {
     @Override
     public OperationResult applyOperation(Document document, OperationRequest request) {
         StringBuilder buffer = document.getContentBuffer();
+        List<CommittedOperation> history = document.getOtHistory();
         long currentRev = document.getRevision();
         long baseRev = request.getBaseRevision();
 
-        int transPos = request.getPosition();
-        String transText = request.getText() != null ? request.getText() : "";
-        int transLen = request.getLength();
-        OperationType type = request.getType();
+        if (baseRev > currentRev) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Base revision is ahead of the server");
+        }
 
-        int transformationsCount = 0;
+        TextOperation op;
+        try {
+            op = request.hasOps()
+                ? TextOperation.fromWire(request.getOps())
+                : fromLegacy(request, lengthAtRevision(buffer.length(), history, baseRev, currentRev));
+        } catch (OtException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Malformed operation");
+        }
+        if (op.insertedChars() > MAX_INSERT_CHARS) {
+            throw new ResponseStatusException(HttpStatus.PAYLOAD_TOO_LARGE, "Operation text exceeds 32KB");
+        }
+
+        String originalOp = abbreviate(op.toString());
         List<String> transformTrace = new ArrayList<>();
+        int transformationsCount = 0;
 
-        // If client's base revision is behind current revision, transform against intervening operations
-        if (baseRev < currentRev) {
-            List<CommittedOperation> history = document.getOtHistory();
-            int startIdx = (int) Math.max(0, baseRev);
-            int endIdx = (int) Math.min(history.size(), currentRev);
-
-            for (int i = startIdx; i < endIdx; i++) {
+        // Transform against every op committed after the client's base revision.
+        // history.get(i) holds revision i + 1, so ops after baseRev live at [baseRev, currentRev).
+        try {
+            for (int i = (int) baseRev; i < (int) currentRev; i++) {
                 CommittedOperation committed = history.get(i);
-                int oldPos = transPos;
-                int oldLen = transLen;
-
-                TransformedOp transformed = transform(
-                    type, transPos, transText, transLen, request.getSessionId(), committed
-                );
-
-                transPos = transformed.position;
-                transLen = transformed.length;
-                transText = transformed.text;
+                TextOperation before = op;
+                op = TextOperation.transform(op, committed.getOperation())[0];
                 transformationsCount++;
-
-                transformTrace.add(String.format(
-                    "Rev %d (%s at %d): pos %d->%d, len %d->%d",
+                transformTrace.add(String.format("Rev %d (%s at %d): %s -> %s",
                     committed.getRevision(), committed.getType(), committed.getPosition(),
-                    oldPos, transPos, oldLen, transLen
-                ));
+                    abbreviate(before.toString()), abbreviate(op.toString())));
             }
+        } catch (OtException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Operation does not match the document at its base revision");
         }
 
-        // Boundary safety clamps
-        int bufLen = buffer.length();
-        transPos = Math.max(0, Math.min(transPos, bufLen));
-        if (type == OperationType.DELETE || type == OperationType.REPLACE) {
-            transLen = Math.max(0, Math.min(transLen, bufLen - transPos));
+        if (op.getBaseLength() != buffer.length()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Operation does not match the document length");
         }
 
-        // Apply mutation to content buffer
-        switch (type) {
-            case INSERT -> {
-                buffer.insert(transPos, transText);
-            }
-            case DELETE -> {
-                if (transLen > 0) {
-                    buffer.delete(transPos, transPos + transLen);
-                }
-            }
-            case REPLACE -> {
-                buffer.replace(transPos, transPos + transLen, transText);
-            }
-        }
+        op.applyTo(buffer);
 
         long newRev = currentRev + 1;
         document.setRevision(newRev);
         document.markUpdated();
 
-        // Record in revision log
-        CommittedOperation committedOp = new CommittedOperation(
-            newRev, request.getSessionId(), type, transPos, transText, transLen
-        );
-        document.getOtHistory().add(committedOp);
+        Summary s = summarize(op);
+        history.add(new CommittedOperation(
+            newRev, request.getSessionId(), s.type, s.position, s.text, s.length, op, request.getClientOpId()
+        ));
 
-        Map<String, Object> debugInfo = new HashMap<>();
+        Map<String, Object> debugInfo = new LinkedHashMap<>();
         debugInfo.put("engine", "OT");
         debugInfo.put("baseRevision", baseRev);
         debugInfo.put("committedRevision", newRev);
         debugInfo.put("transformationsApplied", transformationsCount);
         debugInfo.put("transformTrace", transformTrace);
-        debugInfo.put("originalPosition", request.getPosition());
-        debugInfo.put("finalPosition", transPos);
+        debugInfo.put("originalOps", originalOp);
+        debugInfo.put("finalOps", abbreviate(op.toString()));
+        debugInfo.put("originalPosition", request.hasOps() ? s.position : request.getPosition());
+        debugInfo.put("finalPosition", s.position);
 
         return new OperationResult(
             true, document.getId(), EngineType.OT, newRev,
-            type, transPos, transText, transLen, buffer.toString(), debugInfo
+            s.type, s.position, s.text, s.length, buffer.toString(), debugInfo,
+            op.toWireList(), request.getClientOpId()
         );
     }
 
-    /**
-     * Core OT transformation function T(incoming, committed).
-     */
-    public TransformedOp transform(OperationType inType, int inPos, String inText, int inLen,
-                                   String inSessionId, CommittedOperation committed) {
-        OperationType comType = committed.getType();
-        int comPos = committed.getPosition();
-        String comText = committed.getText();
-        int comLen = committed.getLength();
-        String comSessionId = committed.getSessionId();
-
-        int outPos = inPos;
-        int outLen = inLen;
-        String outText = inText;
-
-        if (inType == OperationType.INSERT) {
-            if (comType == OperationType.INSERT) {
-                // INSERT vs INSERT
-                if (inPos < comPos) {
-                    outPos = inPos;
-                } else if (inPos > comPos) {
-                    outPos = inPos + comText.length();
-                } else {
-                    // Tie-breaker: deterministic order based on session ID
-                    if (inSessionId != null && inSessionId.compareTo(comSessionId) < 0) {
-                        outPos = inPos;
-                    } else {
-                        outPos = inPos + comText.length();
-                    }
-                }
-            } else if (comType == OperationType.DELETE) {
-                // INSERT vs DELETE
-                if (inPos <= comPos) {
-                    outPos = inPos;
-                } else if (inPos >= comPos + comLen) {
-                    outPos = inPos - comLen;
-                } else {
-                    // Insert occurred inside deleted range; snap to delete start
-                    outPos = comPos;
-                }
-            } else if (comType == OperationType.REPLACE) {
-                // INSERT vs REPLACE
-                int delta = comText.length() - comLen;
-                if (inPos <= comPos) {
-                    outPos = inPos;
-                } else if (inPos >= comPos + comLen) {
-                    outPos = inPos + delta;
-                } else {
-                    outPos = comPos + comText.length();
-                }
-            }
-        } else if (inType == OperationType.DELETE) {
-            if (comType == OperationType.INSERT) {
-                // DELETE vs INSERT
-                if (inPos + inLen <= comPos) {
-                    // Delete is strictly before insert
-                    outPos = inPos;
-                    outLen = inLen;
-                } else if (inPos >= comPos) {
-                    // Delete is at or after insert
-                    outPos = inPos + comText.length();
-                    outLen = inLen;
-                } else {
-                    // Insert fell within the deleted range: delete range expands to engulf insert
-                    outPos = inPos;
-                    outLen = inLen + comText.length();
-                }
-            } else if (comType == OperationType.DELETE) {
-                // DELETE vs DELETE
-                int s1 = inPos, e1 = inPos + inLen;
-                int s2 = comPos, e2 = comPos + comLen;
-
-                if (e1 <= s2) {
-                    // in is strictly before com
-                    outPos = inPos;
-                    outLen = inLen;
-                } else if (s1 >= e2) {
-                    // in is strictly after com
-                    outPos = inPos - comLen;
-                    outLen = inLen;
-                } else if (s1 <= s2 && e1 >= e2) {
-                    // in completely covers com
-                    outPos = inPos;
-                    outLen = inLen - comLen;
-                } else if (s1 >= s2 && e1 <= e2) {
-                    // in is completely inside com (already deleted)
-                    outPos = s2;
-                    outLen = 0;
-                } else if (s1 < s2 && e1 <= e2) {
-                    // left overlap
-                    outPos = s1;
-                    outLen = s2 - s1;
-                } else if (s1 >= s2 && e1 > e2) {
-                    // right overlap
-                    outPos = s2;
-                    outLen = e1 - e2;
-                }
-            } else if (comType == OperationType.REPLACE) {
-                // Handle as com DELETE then com INSERT
-                int delta = comText.length() - comLen;
-                if (inPos + inLen <= comPos) {
-                    outPos = inPos;
-                    outLen = inLen;
-                } else if (inPos >= comPos + comLen) {
-                    outPos = inPos + delta;
-                    outLen = inLen;
-                } else {
-                    outPos = comPos + comText.length();
-                    outLen = Math.max(0, (inPos + inLen) - (comPos + comLen));
-                }
-            }
-        } else if (inType == OperationType.REPLACE) {
-            // Transform REPLACE as DELETE + INSERT offset adjustment
-            TransformedOp delPart = transform(OperationType.DELETE, inPos, "", inLen, inSessionId, committed);
-            outPos = delPart.position;
-            outLen = delPart.length;
+    /** Converts a legacy single-span request (position is relative to the base revision document). */
+    static TextOperation fromLegacy(OperationRequest request, int baseLength) {
+        OperationType type = request.getType();
+        if (type == null) {
+            throw new OtException("either ops or type is required");
         }
-
-        return new TransformedOp(outPos, outText, outLen);
+        int pos = Math.max(0, Math.min(request.getPosition(), baseLength));
+        String text = request.getText() != null ? request.getText() : "";
+        int len = Math.max(0, Math.min(request.getLength(), baseLength - pos));
+        return switch (type) {
+            case INSERT -> TextOperation.ofSpan(baseLength, pos, 0, text);
+            case DELETE -> TextOperation.ofSpan(baseLength, pos, len, "");
+            case REPLACE -> TextOperation.ofSpan(baseLength, pos, len, text);
+        };
     }
 
-    public record TransformedOp(int position, String text, int length) {}
+    /** Document length at {@code baseRev}, reconstructed from the current length and the log. */
+    static int lengthAtRevision(int currentLength, List<CommittedOperation> history, long baseRev, long currentRev) {
+        int length = currentLength;
+        for (int i = (int) baseRev; i < (int) currentRev; i++) {
+            TextOperation op = history.get(i).getOperation();
+            length -= op.getTargetLength() - op.getBaseLength();
+        }
+        return length;
+    }
+
+    /** Single-span view of an op (first changed index, inserted text, deleted count) for the Inspector. */
+    static Summary summarize(TextOperation op) {
+        List<Object> ops = op.getOps();
+        int position = 0;
+        int start = 0;
+        if (!ops.isEmpty() && TextOperation.isRetain(ops.get(0))) {
+            position = (Integer) ops.get(0);
+            start = 1;
+        }
+        StringBuilder inserted = new StringBuilder();
+        int deleted = 0;
+        for (int i = start; i < ops.size(); i++) {
+            Object c = ops.get(i);
+            if (TextOperation.isInsert(c)) {
+                inserted.append((String) c);
+            } else if (TextOperation.isDelete(c)) {
+                deleted += -(Integer) c;
+            }
+        }
+        OperationType type = deleted == 0 ? OperationType.INSERT
+            : inserted.length() == 0 ? OperationType.DELETE
+            : OperationType.REPLACE;
+        return new Summary(type, position, inserted.toString(), deleted);
+    }
+
+    private static String abbreviate(String s) {
+        return s.length() <= MAX_TRACE_OP_CHARS ? s : s.substring(0, MAX_TRACE_OP_CHARS) + "…";
+    }
+
+    record Summary(OperationType type, int position, String text, int length) {}
 }

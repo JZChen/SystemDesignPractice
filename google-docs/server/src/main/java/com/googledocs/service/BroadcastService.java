@@ -44,18 +44,22 @@ public class BroadcastService {
         Set<SseEmitter> emitters = docEmitters.get(docId);
         if (emitters == null || emitters.isEmpty()) return;
 
-        Map<String, Object> payload = Map.of(
-            "docId", docId,
-            "revision", result.getRevision(),
-            "engineType", result.getEngineType(),
-            "type", result.getType(),
-            "position", result.getPosition(),
-            "text", result.getText(),
-            "length", result.getLength(),
-            "content", result.getContent(),
-            "authorSessionId", authorSessionId != null ? authorSessionId : "",
-            "debugInfo", result.getDebugInfo()
-        );
+        // LinkedHashMap: Map.of caps at 10 entries and rejects nulls (CRDT results have no ops).
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("docId", docId);
+        payload.put("revision", result.getRevision());
+        payload.put("engineType", result.getEngineType());
+        payload.put("type", result.getType());
+        payload.put("position", result.getPosition());
+        payload.put("text", result.getText());
+        payload.put("length", result.getLength());
+        payload.put("ops", result.getOps());
+        payload.put("clientOpId", result.getClientOpId() != null ? result.getClientOpId() : "");
+        payload.put("contentLength", result.getContentLength());
+        // TODO(j2cl-client): drop full content for OT docs once every client applies ops (see SYSTEM_DESIGN_PLAN).
+        payload.put("content", result.getContent());
+        payload.put("authorSessionId", authorSessionId != null ? authorSessionId : "");
+        payload.put("debugInfo", result.getDebugInfo());
 
         List<SseEmitter> deadEmitters = new ArrayList<>();
         for (SseEmitter emitter : emitters) {

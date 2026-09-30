@@ -44,23 +44,30 @@ const Api = {
   },
 
   /**
-   * API 3: Applies a character-level mutation operation (INSERT, DELETE, REPLACE).
+   * API 3: Applies a mutation.
+   *  - OT documents (J2CL ACK queue): { sessionId, baseRevision, ops, clientOpId }
+   *    where ops is a TextOperation in compact form, e.g. [5, "abc", -2].
+   *  - CRDT documents (legacy): { sessionId, baseRevision, type, position, text, length }.
+   * The HTTP response only confirms receipt; the authoritative ACK arrives on the SSE stream.
    */
-  async applyOperation(docId, { sessionId, baseRevision, type, position, text, length }) {
+  async applyOperation(docId, { sessionId, baseRevision, ops, clientOpId, type, position, text, length }) {
+    const body = ops
+      ? { sessionId, baseRevision: Number(baseRevision), ops: Array.from(ops), clientOpId }
+      : {
+          sessionId,
+          baseRevision: Number(baseRevision),
+          type,
+          position: Number(position),
+          text: text || '',
+          length: Number(length || 0)
+        };
     const res = await fetch(`${API_BASE}/documents/${encodeURIComponent(docId)}/operations`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Session-Id': sessionId
       },
-      body: JSON.stringify({
-        sessionId,
-        baseRevision: Number(baseRevision),
-        type,
-        position: Number(position),
-        text: text || '',
-        length: Number(length || 0)
-      })
+      body: JSON.stringify(body)
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));

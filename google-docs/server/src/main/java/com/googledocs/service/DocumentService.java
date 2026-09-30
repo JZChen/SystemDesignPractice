@@ -68,8 +68,16 @@ public class DocumentService {
         }
         session.touch();
 
+        // Exactly one request form: TextOperation ops (OT only) or legacy type/position/text/length.
+        if (request.hasOps() && doc.getEngineType() == EngineType.CRDT) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "CRDT documents accept only single-span operations");
+        }
+        if (!request.hasOps() && request.getType() == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Either ops or type is required");
+        }
+
         // Check document maximum capacity (DoS guard)
-        int incomingTextLen = request.getText() != null ? request.getText().length() : 0;
+        int incomingTextLen = request.insertedCharCount();
         if (doc.getContent().length() + incomingTextLen > maxDocumentLength) {
             throw new ResponseStatusException(HttpStatus.PAYLOAD_TOO_LARGE, "Document length exceeds maximum allowed limit");
         }
@@ -79,12 +87,14 @@ public class DocumentService {
         try {
             CollaborativeEngine engine = (doc.getEngineType() == EngineType.CRDT) ? crdtEngine : otEngine;
             result = engine.applyOperation(doc, request);
+
+            // Broadcast while still holding the write lock: SSE delivery order == revision order,
+            // which the client ACK queue relies on to tell its own ACK apart from remote ops.
+            // TODO(perf): move to a per-document ordered queue if slow SSE clients become a bottleneck.
+            broadcastService.broadcastOperation(docId, result, request.getSessionId());
         } finally {
             doc.getRwLock().writeLock().unlock();
         }
-
-        // Broadcast to all connected SSE clients
-        broadcastService.broadcastOperation(docId, result, request.getSessionId());
 
         return result;
     }
