@@ -108,7 +108,7 @@ sequenceDiagram
     participant A as Browser A
     participant S as Server (OtEngine)
     participant B as Browser B
-    A->>A: typing window (80 ms idle / 400 ms max) → op
+    A->>A: buffer keystrokes, send after 2 s pause (10 s cap) → op
     A->>S: POST ops @ baseRevision=5, clientOpId=a-1
     B->>S: POST ops @ baseRevision=5 (concurrent)
     S->>S: lock doc · commit A as rev 6

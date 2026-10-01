@@ -12,7 +12,7 @@ The system features:
    - **Real-Time Sync Engine**: A Server-Sent Events (SSE) pub-sub stream, totally ordered by revision, alongside REST mutation and catch-up endpoints for sub-second edit propagation.
 2. **Client (Java core compiled with J2CL + Maven, thin vanilla-JS renderer)**:
    - **Java Client Core (`ot-core` + `web-client`, compiled to `ot-client.js` by J2CL)**: holds all critical collaboration logic, sharing the *same* `transform` code as the server:
-     - **Input Coalescing Window**: listens to editor change events, batches keystrokes within a short window (80 ms idle / 400 ms max, paused during IME composition), and converts them into one operation that is ready to send.
+     - **Input Coalescing Window**: listens to editor change events, batches keystrokes into a local buffer and sends them as one operation only after the user pauses typing (2 s idle / 10 s max, paused during IME composition).
      - **ACK Queue (Jupiter / Google Wave protocol)**: one operation in flight plus a composed buffer. Remote operations are transformed through both before rendering, so local keystrokes are never overwritten.
    - **JavaScript Renderer**: only DOM rendering (textarea, cursor, peer avatars), timers, `fetch` and the SSE connection.
    - **Algorithm Selector & Live Inspector**: Toggle between OT and CRDT; inspect revision history transformations, fractional position trees, and the live ACK queue state in real-time.
@@ -27,10 +27,10 @@ The system features:
 >
 > | Component | Status |
 > |---|---|
-> | `ot-core` (`TextOperation`, `OperationDiff`, `InputCoalescer`, `ClientSyncState`) | ✅ Done. 28 JVM tests pass |
+> | `ot-core` (`TextOperation`, `OperationDiff`, `InputCoalescer`, `ClientSyncState`) | ✅ Done. 34 JVM tests pass |
 > | Server OT engine on `TextOperation`, `ops` + `clientOpId` API, catch-up endpoint | ✅ Done. 13 tests pass (incl. `OtEndToEndTest`) |
 > | `web-client` J2CL bundle (`ot-client.js`) | ⛔ Code written, **build blocked**: Corp Airlock lacks `j2cl-maven-plugin` 0.21.0 dependencies (`auto-value:1.6`, `j2cl backend-closure` / `frontend-javac` / `org.eclipse.jdt.core` `0.11.0-9336533b6`, `closure-compiler-unshaded:v20221102-1`). 0.22.0 is not in Airlock at all |
-> | JS renderer wired to `OtClient` (ACK queue in the browser) | ⏳ Pending the bundle. `app.js` still sends one single-span op per `input` event and overwrites the textarea with the SSE `content` |
+> | JS renderer wired to `OtClient` (ACK queue in the browser) | ⏳ Pending the bundle. Meanwhile `app.js` mirrors the policy on the legacy single-span path: it buffers typing and sends one op after a 2 s pause (10 s cap), keeps one op in flight (the SSE echo matched by `clientOpId` is the ACK), and rebases unsent typing under remote ops instead of overwriting it |
 > | Server-down / restart detection (`/api/health` + `server-status.js`) | ✅ Done |
 > | Strict CSP | ⏳ Not applied yet (current CSP is permissive, see Security §5) |
 > | Docker / docker-compose | ⛔ Broken: still builds `server/` alone, which can't resolve `ot-core` |
@@ -53,8 +53,8 @@ The system features:
 │       ├── main/java/com/googledocs/ot/
 │       │   ├── TextOperation.java             # retain/insert/delete; apply, compose, transform (TP1-safe)
 │       │   ├── OperationDiff.java             # (shadowText, editorText) -> TextOperation
-│       │   ├── ClientSyncState.java           # Jupiter ACK queue: Synchronized / AwaitingConfirm / AwaitingWithBuffer
-│       │   ├── InputCoalescer.java            # Typing window policy (idle 80ms / max 400ms / IME), no timers inside
+│       │   ├── ClientSyncState.java           # Jupiter ACK queue: Synchronized / Buffering / AwaitingConfirm / AwaitingWithBuffer
+│       │   ├── InputCoalescer.java            # Typing window policy (idle 2s / max 10s / IME), no timers inside
 │       │   └── OtException.java               # Invalid op / base-length mismatch
 │       └── test/java/com/googledocs/ot/
 │           ├── TextOperationTest.java         # apply / compose / transform cases
@@ -174,19 +174,25 @@ When users collaborate globally across continents (e.g. US to Europe or Asia), n
    - **Server serialization**: each document has a `ReentrantReadWriteLock`. Concurrent requests are all accepted; they are applied one at a time under the write lock, each transformed against `history[baseRevision..current)`. Verified live with 20 concurrent stale-base (`baseRevision = 0`) requests: all returned `200`, SSE delivered revisions 1–20 in order, and every insert was present exactly once.
    - *Known limitation*: the SSE broadcast runs while the write lock is held (to keep SSE order == revision order), and `SseEmitter.send` is blocking I/O. One slow reader therefore delays every writer on that document, and waiting requests hold Tomcat threads (`TODO(perf)`: commit under the lock, then fan out via a per-document ordered queue with bounded per-connection buffers; slow consumers are dropped and catch up via `?sinceRevision=`). The document-size check also runs before the lock is taken, so two concurrent large inserts can slightly exceed the cap.
 2. **Client ACK Queue (Jupiter / Google Wave Protocol)**:
-   - This is the industry-standard OT client protocol (Jupiter, 1995; used by Google Docs, Google Wave, `ot.js`, ShareDB, Etherpad). The client (`ClientSyncState` in `ot-core`) keeps **at most one operation in flight**, and composes all later local edits into a single **buffer**:
+   - This is the industry-standard OT client protocol (Jupiter, 1995; used by Google Docs, Google Wave, `ot.js`, ShareDB, Etherpad). The client (`ClientSyncState` in `ot-core`) keeps **at most one operation in flight**, and composes all later local edits into a single **buffer**. Local edits are **never sent on their own**: `applyLocal` only composes into the buffer, and the typing window calls `requestSend()` after a 2 s pause (see §3):
      ```mermaid
      stateDiagram-v2
          [*] --> Synchronized
-         Synchronized --> AwaitingConfirm: local op A / send(A)
-         AwaitingConfirm --> AwaitingWithBuffer: local op B / buffer = B
-         AwaitingWithBuffer --> AwaitingWithBuffer: local op C / buffer = compose(buffer, C)
-         AwaitingConfirm --> Synchronized: ACK(A)
-         AwaitingWithBuffer --> AwaitingConfirm: ACK(A) / send(buffer)
+         Synchronized --> Buffering: local op A / buffer = A
+         Buffering --> Buffering: local op B / buffer = compose(buffer, B)
+         Buffering --> AwaitingConfirm: requestSend / send(buffer)
+         AwaitingConfirm --> AwaitingWithBuffer: local op C / buffer = C
+         AwaitingWithBuffer --> AwaitingWithBuffer: local op D / buffer = compose(buffer, D)
+         AwaitingWithBuffer --> AwaitingWithBuffer: requestSend / sendRequested = true
+         AwaitingConfirm --> Synchronized: ACK
+         AwaitingWithBuffer --> AwaitingConfirm: ACK [sendRequested] / send(buffer)
+         AwaitingWithBuffer --> Buffering: ACK [not sendRequested]
          Synchronized --> Synchronized: remote R / apply(R)
+         Buffering --> Buffering: remote R / transform vs buffer, apply(R')
          AwaitingConfirm --> AwaitingConfirm: remote R / transform vs A, apply(R')
-         AwaitingWithBuffer --> AwaitingWithBuffer: remote R / transform vs A then buffer, apply(R'')
+         AwaitingWithBuffer --> AwaitingWithBuffer: remote R / transform vs inflight then buffer, apply(R'')
      ```
+   - **Send gate**: `sendRequested` is set by `requestSend()` while an op is in flight, and cleared by any new local edit. So an ACK only sends the buffer if the user had already paused; if they kept typing, the buffer waits for the next 2 s pause.
    - **Merging the ACK queue with a server update**: a remote op `R` (based on server state `S`) is transformed through the unacknowledged work before it is rendered:
      ```
      (A', R')  = transform(inflight A, R)    // R' is now based on S∘A
@@ -198,19 +204,20 @@ When users collaborate globally across continents (e.g. US to Europe or Asia), n
    - *Status*: implemented and tested on the JVM (`ClientSyncStateTest`, `OtEndToEndTest`). It reaches the browser only once the J2CL bundle builds. Until then `app.js` uses the legacy path, which overwrites the textarea with the server's `content` on every remote op, so keystrokes typed during a round trip can be lost.
    - *Scope*: the ACK queue runs for OT documents. CRDT documents keep a simple one-op-in-flight path (`TODO(crdt-client)`), since CRDT position IDs make them order-independent anyway.
 3. **Input Coalescing Window (Keystroke → Operation)**:
-   - The JS renderer forwards every `input` event to the J2CL client (`InputCoalescer` + `OperationDiff`). Instead of one request per keystroke, edits are batched into one `TextOperation` and flushed when:
-     - **Idle**: no keystroke for **80 ms**, or
-     - **Max window**: **400 ms** of continuous typing have passed, or
-     - **Forced**: immediately before a remote op is applied (so transforms always see the exact local state), and on editor blur.
+   - The JS renderer forwards every `input` event to the J2CL client (`InputCoalescer` + `OperationDiff`). Each keystroke is diffed into the local **buffer** immediately (no network call). The buffer is sent as one `TextOperation` only when:
+     - **Idle**: the user stopped typing for **2 s**, or
+     - **Max window**: **10 s** of continuous typing have passed (safety cap so collaborators still see progress).
+   - A remote op only *captures* pending keystrokes into the buffer (so transforms see the exact local state); it never triggers a send. Blur and tab hide/close do not send either.
    - Flushes never happen during IME composition (`compositionstart` … `compositionend`), so partial characters are never sent.
-   - On flush: `op = diff(shadowText, editorText)` → `ClientSyncState.applyLocal(op)`. While an op is in flight, flushed ops are composed into the buffer, so a whole RTT of typing becomes one request.
-   - *Status*: implemented in `ot-core` (`InputCoalescerTest`); the browser-side timers are wired together with `OtClient`.
+   - On flush: `ClientSyncState.requestSend()` sends the buffer if nothing is in flight; otherwise it is sent on the ACK (see the send gate in §2).
+   - *Trade-offs*: collaborators see edits at least 2 s late, and up to 10 s of unsent typing is lost if the tab is closed.
+   - *Status*: implemented in `ot-core` and `OtClient` (`InputCoalescerTest`, `ClientSyncStateTest`, `OtClientTest`); the browser-side timers are wired together with `OtClient`.
 4. **CRDT Resilience**:
    - Because CRDT character IDs are immutable fractional values (e.g. `[1, 5, 2]`), operations are mathematically commutative.
    - Even if packet delivery is delayed or reordered by the internet, the document converges to the exact same text for every user globally.
 5. **Peer Presence & Anonymous Identities**:
    - When a friend opens the link, the server assigns a random fun persona (e.g. "Anonymous Panda", "Anonymous Falcon") with a distinctive color badge.
-   - Friends can see each other's live presence in the header, and the Concurrency Inspector shows the local sync state (`Synchronized` / `AwaitingConfirm` / `AwaitingWithBuffer`).
+   - Friends can see each other's live presence in the header, and the Concurrency Inspector shows the local sync state (`Synchronized` / `Buffering` / `AwaitingConfirm` / `AwaitingWithBuffer`).
    - Identity = the `sessionId` stored in `localStorage` (`google_docs_session_id`), shared by all tabs of one browser profile on one origin. To test as a second user, use an Incognito window, another browser/profile, or the other host name (`localhost` vs `127.0.0.1`).
 6. **Server Outage & Restart Detection**:
    - Documents live only in server memory, so a restart loses them. `server-status.js` polls `GET /api/health` (every 15 s while up, every 3 s while down, 3 s timeout); SSE errors and failed `fetch` calls trigger an immediate check.
@@ -353,16 +360,18 @@ Target: `mvn test` from the repo root (full reactor: `ot-core` → `web-client` 
 
 ```bash
 export JAVA_HOME=/opt/homebrew/opt/openjdk@21
-mvn -B -pl ot-core install          # 28 tests
+mvn -B -pl ot-core install          # 34 tests
 mvn -B -f server/pom.xml test       # 13 tests
+mvn -B -pl web-client test          # 4 OtClient tests (JVM only; J2CL runs later, at prepare-package)
 ```
 
 1. **Shared OT Core Tests (`ot-core`, run on the JVM)**: ✅ passing
    - `TextOperationTest`: apply / compose / transform unit cases, including *insert inside a concurrent delete* (the insert survives and the delete splits around it).
    - `TransformPropertyTest`: randomized, seeded **TP1 fuzz** over 10,000 op pairs: `apply(apply(S,a),b') == apply(apply(S,b),a')`, and compose matches sequential apply.
-   - `ClientSyncStateTest`: two simulated clients plus an in-memory server with random delay and reordering (200 seeds); asserts every ACK queue transition and final convergence.
-   - `InputCoalescerTest` / `OperationDiffTest`: idle / max-window / IME flush rules and the keystroke → operation diff.
+   - `ClientSyncStateTest`: two simulated clients plus an in-memory server with random delay and reordering (200 seeds); asserts every ACK queue transition (incl. `Buffering` and the `requestSend` gate) and final convergence.
+   - `InputCoalescerTest` / `OperationDiffTest`: idle / max-window / IME flush rules (2 s / 10 s defaults) and the keystroke → operation diff.
 2. **J2CL Build Check (`web-client`)**: ⛔ blocked
+   - `OtClientTest` (✅ passing, plain JVM): no send while typing then one request after a 2 s pause; 10 s cap; remote op while buffering renders merged text without sending; typing during an in-flight op waits for the next pause after the ACK.
    - `mvn -pl ot-core,web-client install` should produce `static/js/ot-client.js`, and `window.OtClient` (with `onServerEvent` etc.) must survive `ADVANCED_OPTIMIZATIONS`. Blocked until Airlock provides the plugin dependencies listed in the status table.
 3. **Server Unit & Concurrency Tests**: ✅ passing
    - `OtEngineTest`: multi-client concurrent insertion, deletion and boundary shifts (legacy single-span requests), plus rejection of `baseLength` mismatches and `baseRevision > current`.
@@ -380,7 +389,7 @@ mvn -B -f server/pom.xml test       # 13 tests
    - ✅ **Concurrency smoke test (HTTP)**: 20 concurrent `ops` requests from 2 sessions, all at `baseRevision = 0`, plus one SSE listener: 20× `200`, SSE revisions 1–20 in order, final revision 20, all 20 inserts present exactly once.
    - ⏳ **Server-down screen** (endpoint and assets verified with `curl`; browser check pending): stop the server (`lsof -ti tcp:8081 -sTCP:LISTEN | xargs kill`); the open tab should show "Server is down" within a few seconds. Restart it; the tab should show "Server is back" and reload onto a new document.
    - ⏳ (needs the J2CL bundle) Type rapidly at the same spot and across overlapping delete ranges in both windows: the text ends up identical, with no lost keystrokes and no flicker.
-   - ⏳ Throttle one window (DevTools → Slow 3G): the Inspector sync badge cycles `AwaitingConfirm` → `AwaitingWithBuffer` → `Synchronized`, and the request count drops because keystrokes are coalesced.
+   - ⏳ (needs the J2CL bundle) Type a sentence and watch DevTools → Network: no `POST …/operations` while typing; exactly one request ~2 s after the last keystroke (or every 10 s if you never pause). The Inspector badge shows `Buffering` while typing, then `AwaitingConfirm` → `Synchronized`.
    - ⏳ Toggle offline for 5 s: after the SSE stream reconnects, catch-up via `?sinceRevision=` restores convergence.
    - ⏳ Type with an IME (e.g. Pinyin): no partial composition ops are sent.
 2. **Tunnel Test**:
