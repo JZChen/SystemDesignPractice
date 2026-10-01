@@ -13,8 +13,21 @@
   let currentRevision = 0;
   let syncStream = null;
   let isApplyingRemoteChange = false;
-  let previousContent = '';
   let operationLog = [];
+
+  // Local edit buffer (legacy path, used until the J2CL OtClient ships; same policy as the Java
+  // client). Keystrokes stay in the textarea and go out as ONE op after a 2 s typing pause, or
+  // after 10 s of continuous typing. At most one op is in flight; its SSE echo is the ACK.
+  // Every send is diffed against serverContent, so whatever the server is missing gets sent.
+  const IDLE_SEND_MS = 2000;
+  const MAX_BUFFER_MS = 10000;
+  let serverContent = '';     // document text at serverRevision, as last seen from the server
+  let serverRevision = 0;
+  let firstUnsentAt = null;   // performance.now() of the first keystroke not yet sent
+  let inflight = null;        // { clientOpId, op } waiting for its SSE echo
+  let sendRequested = false;  // a pause was reached while an op was in flight: send on ACK
+  let opCounter = 0;
+  const instanceId = Math.random().toString(36).slice(2, 10);
 
   // J2CL client core (OT documents). The Java side owns the typing window, the ACK queue and
   // remote-op merging; this file only renders, runs timers and talks to the network.
@@ -98,11 +111,12 @@
       renderDocument(doc);
       connectRealTimeSync(doc.docId);
 
-      // Preload initial welcome text
+      // Preload initial welcome text (programmatic content: sent right away, no typing window)
       setTimeout(() => {
-        applyLocalChange(
-          'Welcome to Collaborative Google Docs!\n\nThis prototype demonstrates real-time distributed text editing backed by Spring Boot 3.\n\nHighlights:\n• Concurrency Engine: Pluggable Operational Transformation (OT) & Sequence CRDT (LSeq).\n• Sub-second global sync: Push stream with Server-Sent Events (SSE).\n• Open the Concurrency Inspector (top-right icon) to see live transformations in action!\n• Click "Share Link" to collaborate with friends globally across the internet.\n'
-        );
+        docEditorEl.value =
+          'Welcome to Collaborative Google Docs!\n\nThis prototype demonstrates real-time distributed text editing backed by Spring Boot 3.\n\nHighlights:\n• Concurrency Engine: Pluggable Operational Transformation (OT) & Sequence CRDT (LSeq).\n• Sub-second global sync: Push stream with Server-Sent Events (SSE).\n• Open the Concurrency Inspector (top-right icon) to see live transformations in action!\n• Click "Share Link" to collaborate with friends globally across the internet.\n';
+        updateEditorStats();
+        requestSend();
       }, 300);
     } catch (err) {
       showToast('Error initializing document: ' + err.message);
@@ -129,7 +143,13 @@
   function renderDocument(doc) {
     currentDoc = doc;
     currentRevision = doc.revision || 0;
-    previousContent = doc.content || '';
+    serverRevision = currentRevision;
+    serverContent = doc.content || '';
+    clearTimeout(flushTimer);
+    flushTimer = null;
+    firstUnsentAt = null;
+    inflight = null;
+    sendRequested = false;
 
     docTitleEl.textContent = doc.title || 'Untitled Document';
     docEditorEl.value = doc.content || '';
@@ -152,7 +172,7 @@
     sessionIdIndicatorEl.textContent = currentSessionId ? currentSessionId.slice(0, 12) + '...' : 'Guest';
     updateEditorStats();
     updatePresence(doc.activeUsers || []);
-    saveStatusEl.textContent = 'All changes saved';
+    renderSyncState();
   }
 
   // --------------------------------------------------------------------------
@@ -185,48 +205,141 @@
   }
 
   function handleRemoteOperation(data) {
-    // If we authored this operation, we already applied it locally
-    if (data.authorSessionId && data.authorSessionId === currentSessionId) {
-      currentRevision = data.revision;
-      revisionBadgeEl.textContent = `Rev ${currentRevision}`;
+    if (typeof data.revision !== 'number' || data.revision <= serverRevision) return; // duplicate / stale
+
+    const oldServer = serverContent;
+    const newServer = typeof data.content === 'string' ? data.content : oldServer;
+    serverContent = newServer;
+    serverRevision = data.revision;
+    currentRevision = data.revision;
+    revisionBadgeEl.textContent = `Rev ${currentRevision}`;
+
+    // ACK = the SSE echo of our in-flight op (clientOpId match; session match if the engine
+    // doesn't echo clientOpId). Other tabs of the same session are treated as remote peers.
+    const isOwnAck = inflight !== null && (data.clientOpId
+      ? data.clientOpId === inflight.clientOpId
+      : data.authorSessionId === currentSessionId);
+
+    if (isOwnAck) {
+      inflight = null;
+      const hasUnsent = flushTimer !== null || sendRequested;
+      if (!hasUnsent && !composing && docEditorEl.value !== newServer) {
+        // Nothing typed since the send, but the editor disagrees with the server: server wins.
+        const fix = toSpan(calculateDiffOperation(docEditorEl.value, newServer));
+        renderEditor(newServer, (i) => mapIndex(i, fix));
+      }
+      if (sendRequested) {
+        sendBuffer();
+      } else {
+        renderSyncState();
+      }
       return;
     }
 
+    // Remote op. Keep everything the server doesn't have yet (in-flight + unsent typing) and
+    // re-apply it on top of the new server text instead of overwriting it.
+    const remote = remoteSpan(data, oldServer, newServer);
+    const local = toSpan(calculateDiffOperation(oldServer, docEditorEl.value));
+    if (remote) {
+      if (!local) {
+        renderEditor(newServer, (i) => mapIndex(i, remote));
+      } else {
+        const rebased = transformSpan(local, remote);
+        const merged = applySpan(newServer, rebased);
+        renderEditor(merged, (i) => mapCursorThroughRebase(i, local, remote, rebased));
+      }
+    }
+
+    addOperationToFeed({
+      type: data.type || 'REPLACE',
+      position: data.position,
+      text: data.text || '',
+      length: data.length,
+      revision: data.revision,
+      isRemote: true,
+      debugInfo: data.debugInfo
+    });
+    renderSyncState();
+  }
+
+  /** Replace the textarea text (if changed) and remap the selection with mapFn. */
+  function renderEditor(text, mapFn) {
+    if (docEditorEl.value === text) return;
+    const start = docEditorEl.selectionStart;
+    const end = docEditorEl.selectionEnd;
     isApplyingRemoteChange = true;
     try {
-      const cursorStart = docEditorEl.selectionStart;
-      const cursorEnd = docEditorEl.selectionEnd;
-
-      // Update editor text safely
-      docEditorEl.value = data.content;
-      previousContent = data.content;
-      currentRevision = data.revision;
-      revisionBadgeEl.textContent = `Rev ${currentRevision}`;
-
-      // Adjust cursor position if remote edit happened before our cursor
-      let newCursor = cursorStart;
-      if (data.type === 'INSERT' && data.position <= cursorStart) {
-        newCursor = cursorStart + (data.text ? data.text.length : 0);
-      } else if (data.type === 'DELETE' && data.position < cursorStart) {
-        newCursor = Math.max(data.position, cursorStart - (data.length || 0));
-      }
-      docEditorEl.setSelectionRange(newCursor, newCursor);
-
+      docEditorEl.value = text;
+      const clamp = (i) => Math.max(0, Math.min(text.length, i));
+      docEditorEl.setSelectionRange(clamp(mapFn(start)), clamp(mapFn(end)));
       updateEditorStats();
-
-      // Log in inspector
-      addOperationToFeed({
-        type: data.type,
-        position: data.position,
-        text: data.text,
-        length: data.length,
-        revision: data.revision,
-        isRemote: true,
-        debugInfo: data.debugInfo
-      });
     } finally {
       isApplyingRemoteChange = false;
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // Single-span helpers: a span is { pos, del, ins } = "delete del chars at pos, insert ins".
+  // --------------------------------------------------------------------------
+
+  function toSpan(op) {
+    return op ? { pos: op.position, del: op.length || 0, ins: op.text || '' } : null;
+  }
+
+  /**
+   * The committed remote edit as a span: the server's own single-span fields when they turn
+   * oldServer into newServer exactly (a text diff is ambiguous, e.g. "a two three" -> "a three"),
+   * otherwise a prefix/suffix diff. Null if the text didn't change.
+   */
+  function remoteSpan(data, oldServer, newServer) {
+    if (oldServer === newServer) return null;
+    if (typeof data.position === 'number' && data.type) {
+      const s = {
+        pos: data.position,
+        del: data.type === 'INSERT' ? 0 : (data.length || 0),
+        ins: data.type === 'DELETE' ? '' : (data.text || '')
+      };
+      if (s.pos >= 0 && s.pos + s.del <= oldServer.length && applySpan(oldServer, s) === newServer) {
+        return s;
+      }
+    }
+    return toSpan(calculateDiffOperation(oldServer, newServer));
+  }
+
+  function applySpan(text, s) {
+    return text.slice(0, s.pos) + s.ins + text.slice(s.pos + s.del);
+  }
+
+  /** Index in the text before s -> index after s (an insert at i pushes i to the right). */
+  function mapIndex(i, s) {
+    if (!s || i < s.pos) return i;
+    if (i >= s.pos + s.del) return i + s.ins.length - s.del;
+    return s.pos + s.ins.length; // inside the deleted range
+  }
+
+  /**
+   * Rebase local span l onto remote span r (both relative to the same base text). Ties: a local
+   * insert at the same index goes before the remote one. If the local delete wraps the whole
+   * remote edit, the remote text is deleted too (single-span limitation; the next send diffs
+   * against the server text, so the server stays authoritative).
+   */
+  function transformSpan(l, r) {
+    const d = r.ins.length - r.del;
+    const rEnd = r.pos + r.del;
+    const lEnd = l.pos + l.del;
+    if (lEnd <= r.pos) return { pos: l.pos, del: l.del, ins: l.ins };
+    if (l.pos >= rEnd) return { pos: l.pos + d, del: l.del, ins: l.ins };
+    const start = l.pos <= r.pos ? l.pos : r.pos + r.ins.length;
+    const end = lEnd >= rEnd ? lEnd + d : r.pos;
+    return { pos: start, del: Math.max(0, end - start), ins: l.ins };
+  }
+
+  /** Cursor index in the editor (base + l) -> index in the merged text (base + r + rebased l). */
+  function mapCursorThroughRebase(i, l, r, rebased) {
+    if (i < l.pos) return mapIndex(i, r);
+    if (i <= l.pos + l.ins.length) return rebased.pos + (i - l.pos);
+    const inBase = i - l.ins.length + l.del;
+    return Math.max(rebased.pos + l.ins.length, mapIndex(inBase, r) + l.ins.length - rebased.del);
   }
 
   function updatePresence(users) {
@@ -249,6 +362,11 @@
 
   function setupEventListeners() {
     docEditorEl.addEventListener('input', handleEditorInput);
+    docEditorEl.addEventListener('compositionstart', () => { composing = true; });
+    docEditorEl.addEventListener('compositionend', () => {
+      composing = false;
+      handleEditorInput();
+    });
     docEditorEl.addEventListener('keyup', updateEditorStats);
     docEditorEl.addEventListener('click', updateEditorStats);
 
@@ -280,40 +398,70 @@
     });
   }
 
+  /** Keystroke: the text stays in the textarea (the local buffer); only the send timer moves. */
   function handleEditorInput() {
     if (isApplyingRemoteChange || !currentDoc) return;
-
-    const newContent = docEditorEl.value;
-    applyLocalChange(newContent);
+    sendRequested = false; // still typing: wait for the next pause, even if an ACK arrives first
+    scheduleSend();
+    updateEditorStats();
+    renderSyncState();
   }
 
-  async function applyLocalChange(newContent) {
-    const oldContent = previousContent;
-    if (newContent === oldContent) return;
+  /** (Re)arm the send timer: 2 s after the last keystroke, but no later than 10 s after the first. */
+  function scheduleSend() {
+    const now = performance.now();
+    if (firstUnsentAt === null) firstUnsentAt = now;
+    const delay = Math.max(0, Math.min(IDLE_SEND_MS, firstUnsentAt + MAX_BUFFER_MS - now));
+    clearTimeout(flushTimer);
+    flushTimer = setTimeout(onTypingPause, delay);
+  }
 
-    // Diff oldContent and newContent to find single mutation
-    const op = calculateDiffOperation(oldContent, newContent);
-    if (!op) return;
+  function onTypingPause() {
+    flushTimer = null;
+    if (composing) {
+      // Never send a half-composed IME character; try again after the next pause.
+      flushTimer = setTimeout(onTypingPause, IDLE_SEND_MS);
+      return;
+    }
+    firstUnsentAt = null;
+    requestSend();
+  }
 
-    previousContent = newContent;
-    saveStatusEl.textContent = 'Saving...';
-    updateEditorStats();
+  /** Send now if nothing is in flight; otherwise send as soon as the in-flight op is ACKed. */
+  function requestSend() {
+    if (inflight) {
+      sendRequested = true;
+      renderSyncState();
+      return;
+    }
+    sendBuffer();
+  }
+
+  async function sendBuffer() {
+    sendRequested = false;
+    if (!currentDoc) return;
+    const docId = currentDoc.docId;
+    const op = calculateDiffOperation(serverContent, docEditorEl.value);
+    if (!op) {
+      renderSyncState();
+      return;
+    }
+    const clientOpId = `L${instanceId}-${++opCounter}`;
+    inflight = { clientOpId, op };
+    renderSyncState();
 
     try {
-      const result = await Api.applyOperation(currentDoc.docId, {
+      const result = await Api.applyOperation(docId, {
         sessionId: currentSessionId,
-        baseRevision: currentRevision,
+        baseRevision: serverRevision,
+        clientOpId,
         type: op.type,
         position: op.position,
         text: op.text,
         length: op.length
       });
 
-      currentRevision = result.revision;
-      revisionBadgeEl.textContent = `Rev ${currentRevision}`;
-      saveStatusEl.textContent = 'All changes saved';
-
-      // Log to inspector
+      // Not the ACK: the SSE echo is (it is the only channel ordered by revision).
       addOperationToFeed({
         type: op.type,
         position: result.position,
@@ -324,9 +472,44 @@
         debugInfo: result.debugInfo
       });
     } catch (err) {
+      if (inflight && inflight.clientOpId === clientOpId) {
+        inflight = null; // the text is still in the editor; the next pause retries it
+      }
+      renderSyncState();
       saveStatusEl.textContent = 'Sync error';
       showToast('Mutation error: ' + err.message);
     }
+  }
+
+  /** Header status + Inspector ACK-queue view for the local buffer. */
+  function renderSyncState() {
+    const buffering = flushTimer !== null || sendRequested;
+    let state;
+    if (inflight && buffering) state = 'AwaitingWithBuffer';
+    else if (inflight) state = 'AwaitingConfirm';
+    else if (buffering) state = 'Buffering';
+    else if (docEditorEl.value !== serverContent) state = 'Unsaved';
+    else state = 'Synchronized';
+
+    syncStateBadgeEl.textContent = state;
+    if (state === 'Buffering' || state === 'AwaitingWithBuffer') {
+      saveStatusEl.textContent = 'Editing… saves 2 s after you stop typing';
+    } else if (state === 'AwaitingConfirm') {
+      saveStatusEl.textContent = 'Saving...';
+    } else if (state === 'Unsaved') {
+      saveStatusEl.textContent = 'Unsaved changes';
+    } else {
+      saveStatusEl.textContent = 'All changes saved';
+    }
+
+    const describe = (op) => op
+      ? `${op.type} @${op.position}` + (op.length ? ` -${op.length}` : '') +
+        (op.text ? ` "${op.text.length > 20 ? op.text.slice(0, 20) + '…' : op.text}"` : '')
+      : '-';
+    ackQueueViewEl.textContent =
+      `inflight: ${inflight ? inflight.clientOpId + ' ' + describe(inflight.op) : '-'}\n` +
+      `unsaved:  ${describe(calculateDiffOperation(serverContent, docEditorEl.value))}` +
+      (sendRequested ? '  (send on ACK)' : '');
   }
 
   /**

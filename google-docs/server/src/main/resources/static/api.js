@@ -72,7 +72,8 @@ const Api = {
           type,
           position: Number(position),
           text: text || '',
-          length: Number(length || 0)
+          length: Number(length || 0),
+          ...(clientOpId ? { clientOpId } : {})
         };
     const res = await apiFetch(`${API_BASE}/documents/${encodeURIComponent(docId)}/operations`, {
       method: 'POST',
