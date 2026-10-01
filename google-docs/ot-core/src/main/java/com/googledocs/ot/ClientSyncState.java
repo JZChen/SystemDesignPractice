@@ -4,19 +4,27 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Client-side OT synchronization: the Jupiter / Google Wave "ACK queue" state machine.
+ * Client-side OT synchronization: the Jupiter / Google Wave "ACK queue" state machine, with a
+ * send gate so local edits are only sent when the host's typing policy says so.
  *
  * <pre>
- *   Synchronized        -- local A  --> AwaitingConfirm      (send A)
- *   AwaitingConfirm     -- local B  --> AwaitingWithBuffer   (buffer = B)
- *   AwaitingWithBuffer  -- local C  --> AwaitingWithBuffer   (buffer = compose(buffer, C))
- *   AwaitingConfirm     -- ACK(A)   --> Synchronized
- *   AwaitingWithBuffer  -- ACK(A)   --> AwaitingConfirm      (send buffer)
- *   any                 -- remote R --> same state           (transform R through inflight, then buffer)
+ *   Synchronized        -- local A       --> Buffering            (buffer = A, no send)
+ *   Buffering           -- local B       --> Buffering            (buffer = compose(buffer, B))
+ *   Buffering           -- requestSend   --> AwaitingConfirm      (send buffer)
+ *   AwaitingConfirm     -- local C       --> AwaitingWithBuffer   (buffer = C)
+ *   AwaitingWithBuffer  -- requestSend   --> AwaitingWithBuffer   (sendRequested = true)
+ *   AwaitingConfirm     -- ACK           --> Synchronized
+ *   AwaitingWithBuffer  -- ACK           --> AwaitingConfirm      (send buffer)  if sendRequested
+ *                                        --> Buffering            (wait)         otherwise
+ *   any                 -- remote R      --> same state           (transform R through inflight, then buffer)
  * </pre>
  *
  * <p>Invariants:
  * <ul>
+ *   <li>{@link #applyLocal} never sends: it only records the edit, so remote ops are always
+ *       transformed against the exact local document.</li>
+ *   <li>Only {@link #requestSend} (or an ACK while {@code sendRequested}) puts an op on the wire.
+ *       New local typing clears {@code sendRequested}: the host must request again after the next pause.</li>
  *   <li>At most one operation is in flight; it is based on server revision {@code serverRevision}.</li>
  *   <li>{@code buffer} is based on the state after {@code inflight}.</li>
  *   <li>Server events are processed strictly in revision order; out-of-order events wait in a small
@@ -51,7 +59,8 @@ public final class ClientSyncState {
     private int serverLength;          // document length at serverRevision (sanity check)
     private TextOperation inflight;    // null => Synchronized
     private String inflightId;
-    private TextOperation buffer;      // null unless AwaitingWithBuffer
+    private TextOperation buffer;      // local edits not yet sent (based on server ∘ inflight)
+    private boolean sendRequested;     // host asked to send; honor it when the in-flight op is ACKed
     private int opCounter;
     private boolean failed;
 
@@ -75,20 +84,39 @@ public final class ClientSyncState {
     // Local edits
     // ------------------------------------------------------------------------------------------
 
-    /** Enqueue a local op (based on the current local document = server ∘ inflight ∘ buffer). */
+    /**
+     * Record a local op (based on the current local document = server ∘ inflight ∘ buffer).
+     * Never sends; new typing also cancels a pending {@link #requestSend}.
+     */
     public void applyLocal(TextOperation op) {
         if (failed || op.isNoop()) {
             return;
         }
-        if (inflight == null) {
-            inflight = op;
-            inflightId = nextId();
-            listener.sendToServer(inflight, serverRevision, inflightId);
-        } else if (buffer == null) {
-            buffer = op;
-        } else {
-            buffer = buffer.compose(op);
+        buffer = (buffer == null) ? op : buffer.compose(op);
+        sendRequested = false;
+    }
+
+    /**
+     * The host's typing policy says "send now" (e.g. 2 s pause). Sends the buffer immediately if
+     * nothing is in flight, otherwise as soon as the in-flight op is ACKed.
+     */
+    public void requestSend() {
+        if (failed || buffer == null) {
+            return;
         }
+        if (inflight == null) {
+            sendBuffer();
+        } else {
+            sendRequested = true;
+        }
+    }
+
+    private void sendBuffer() {
+        inflight = buffer;
+        buffer = null;
+        sendRequested = false;
+        inflightId = nextId();
+        listener.sendToServer(inflight, serverRevision, inflightId);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -145,14 +173,12 @@ public final class ClientSyncState {
         serverRevision = e.revision;
         checkLength(e);
 
-        inflight = buffer;
-        buffer = null;
-        if (inflight != null) {
-            inflightId = nextId();
-            listener.sendToServer(inflight, serverRevision, inflightId);
-        } else {
-            inflightId = null;
+        inflight = null;
+        inflightId = null;
+        if (buffer != null && sendRequested) {
+            sendBuffer();
         }
+        // else: Synchronized, or Buffering until the host's next requestSend()
     }
 
     private void handleRemote(ServerEvent e) {
@@ -202,14 +228,19 @@ public final class ClientSyncState {
     // Introspection (Inspector UI, tests)
     // ------------------------------------------------------------------------------------------
 
+    /** "Synchronized" | "Buffering" | "AwaitingConfirm" | "AwaitingWithBuffer" | "Resyncing". */
     public String getStateName() {
         if (failed) {
             return "Resyncing";
         }
         if (inflight == null) {
-            return "Synchronized";
+            return buffer == null ? "Synchronized" : "Buffering";
         }
         return buffer == null ? "AwaitingConfirm" : "AwaitingWithBuffer";
+    }
+
+    public boolean isSendRequested() {
+        return sendRequested;
     }
 
     public long getServerRevision() {

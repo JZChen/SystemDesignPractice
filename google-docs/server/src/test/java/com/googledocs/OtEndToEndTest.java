@@ -45,9 +45,10 @@ class OtEndToEndTest {
 
         for (int step = 0; step < 80; step++) {
             Client c = clients.get(rnd.nextInt(clients.size()));
-            switch (rnd.nextInt(3)) {
+            switch (rnd.nextInt(4)) {
                 case 0 -> c.localEdit(rnd);
                 case 1 -> c.deliverOneSend();
+                case 2 -> c.sync.requestSend(); // the user paused typing
                 default -> c.pullOneEvent(rnd);
             }
         }
@@ -55,6 +56,7 @@ class OtEndToEndTest {
         while (progress) {
             progress = false;
             for (Client c : clients) {
+                c.sync.requestSend();
                 progress |= c.deliverOneSend();
                 progress |= c.pullOneEvent(rnd);
             }

@@ -20,10 +20,15 @@ class ClientSyncStateTest {
         ClientSyncState s = new ClientSyncState("me", "t", 0, 5, l); // server doc "hello" at rev 0
         String local = "hello";
 
-        // Synchronized -> AwaitingConfirm
+        // Synchronized -> Buffering: local edits never send by themselves
         TextOperation a = OperationDiff.diff(local, "hello!");
         local = a.apply(local);
         s.applyLocal(a);
+        assertEquals("Buffering", s.getStateName());
+        assertEquals(0, l.sent.size());
+
+        // Buffering -> AwaitingConfirm on requestSend (the 2 s pause)
+        s.requestSend();
         assertEquals("AwaitingConfirm", s.getStateName());
         assertEquals(1, l.sent.size());
         assertEquals(0L, l.sentBase.get(0));
@@ -36,7 +41,9 @@ class ClientSyncStateTest {
         local = c.apply(local);
         s.applyLocal(c);
         assertEquals("AwaitingWithBuffer", s.getStateName());
+        s.requestSend(); // pause while A is in flight: remembered, not sent
         assertEquals(1, l.sent.size(), "only one op may be in flight");
+        assertTrue(s.isSendRequested());
 
         // Remote op from someone else, based on rev 0: insert ">> " at the start of "hello"
         TextOperation remote = TextOperation.ofSpan(5, 0, 0, ">> ");
@@ -44,7 +51,7 @@ class ClientSyncStateTest {
         local = l.applied.get(0).apply(local);
         assertEquals(">> hello!!?", local);
 
-        // ACK for our in-flight op arrives as revision 2 -> buffer is sent, based on rev 2
+        // ACK for our in-flight op arrives as revision 2 -> requested buffer is sent, based on rev 2
         s.onServerEvent(2, "me", l.sentIds.get(0), null, 9);
         assertEquals("AwaitingConfirm", s.getStateName());
         assertEquals(2, l.sent.size());
@@ -55,6 +62,77 @@ class ClientSyncStateTest {
         s.onServerEvent(3, "me", l.sentIds.get(1), null, 11);
         assertEquals("Synchronized", s.getStateName());
         assertNull(l.resyncReason);
+    }
+
+    @Test
+    void localEditsAreBufferedUntilRequestSend() {
+        RecordingListener l = new RecordingListener();
+        ClientSyncState s = new ClientSyncState("me", "t", 0, 0, l);
+        String local = "";
+        for (String next : new String[] {"H", "He", "Hel", "Hell", "Hello"}) {
+            TextOperation op = OperationDiff.diff(local, next);
+            local = next;
+            s.applyLocal(op);
+        }
+        assertEquals(0, l.sent.size(), "typing alone must not hit the network");
+        assertEquals("Buffering", s.getStateName());
+
+        s.requestSend();
+        assertEquals(1, l.sent.size(), "all buffered keystrokes go out as one op");
+        assertEquals("Hello", l.sent.get(0).apply(""));
+        assertNull(s.getBuffer());
+    }
+
+    @Test
+    void requestSendWhileInflightSendsBufferOnAck() {
+        RecordingListener l = new RecordingListener();
+        ClientSyncState s = new ClientSyncState("me", "t", 0, 0, l);
+        s.applyLocal(new TextOperation().insert("a"));
+        s.requestSend();
+        s.applyLocal(new TextOperation().retain(1).insert("b"));
+        s.requestSend();
+        assertEquals(1, l.sent.size());
+
+        s.onServerEvent(1, "me", l.sentIds.get(0), null, 1);
+        assertEquals(2, l.sent.size());
+        assertEquals(1L, l.sentBase.get(1));
+        assertEquals("AwaitingConfirm", s.getStateName());
+    }
+
+    @Test
+    void typingAfterRequestHoldsBufferPastAck() {
+        RecordingListener l = new RecordingListener();
+        ClientSyncState s = new ClientSyncState("me", "t", 0, 0, l);
+        s.applyLocal(new TextOperation().insert("a"));
+        s.requestSend();                                        // A in flight
+        s.applyLocal(new TextOperation().retain(1).insert("b"));
+        s.requestSend();                                        // pause...
+        s.applyLocal(new TextOperation().retain(2).insert("c")); // ...but the user resumed typing
+        assertFalse(s.isSendRequested());
+
+        s.onServerEvent(1, "me", l.sentIds.get(0), null, 1);
+        assertEquals(1, l.sent.size(), "buffer must wait for the next pause");
+        assertEquals("Buffering", s.getStateName());
+
+        s.requestSend();
+        assertEquals(2, l.sent.size());
+        assertEquals("abc", l.sent.get(1).apply("a"));
+    }
+
+    @Test
+    void remoteOpWhileBufferingIsTransformedAndNotSent() {
+        RecordingListener l = new RecordingListener();
+        ClientSyncState s = new ClientSyncState("me", "t", 0, 5, l); // "hello"
+        s.applyLocal(OperationDiff.diff("hello", "hello world"));
+        s.onServerEvent(1, "peer", "p-1", TextOperation.ofSpan(5, 0, 0, ">> "), 8);
+
+        assertEquals(0, l.sent.size(), "remote ops must not trigger a send");
+        assertEquals("Buffering", s.getStateName());
+        assertEquals(">> hello world", l.applied.get(0).apply("hello world"));
+
+        s.requestSend();
+        assertEquals(1L, l.sentBase.get(0));
+        assertEquals(">> hello world", l.sent.get(0).apply(">> hello"));
     }
 
     @Test
@@ -87,6 +165,7 @@ class ClientSyncStateTest {
         RecordingListener l = new RecordingListener();
         ClientSyncState s = new ClientSyncState("me", "t", 0, 0, l);
         s.applyLocal(new TextOperation().insert("x"));
+        s.requestSend();
         s.onSendFailed(l.sentIds.get(0));
         assertNotNull(l.resyncReason);
     }
@@ -111,23 +190,27 @@ class ClientSyncStateTest {
 
         for (int step = 0; step < steps; step++) {
             SimClient c = clients.get(rnd.nextInt(clientCount));
-            switch (rnd.nextInt(3)) {
+            switch (rnd.nextInt(4)) {
                 case 0:
                     c.localEdit(RandomOps.randomOp(rnd, c.doc));
                     break;
                 case 1:
                     c.deliverOneSend();
                     break;
+                case 2:
+                    c.sync.requestSend(); // the user paused typing
+                    break;
                 default:
                     c.deliverOneEvent(rnd);
                     break;
             }
         }
-        // Drain everything
+        // Drain everything (every client eventually pauses, so buffers get sent)
         boolean progress = true;
         while (progress) {
             progress = false;
             for (SimClient c : clients) {
+                c.sync.requestSend();
                 progress |= c.deliverOneSend();
                 progress |= c.deliverOneEvent(rnd);
             }

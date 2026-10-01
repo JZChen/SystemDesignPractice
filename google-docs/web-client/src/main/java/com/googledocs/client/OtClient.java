@@ -21,8 +21,9 @@ import jsinterop.annotations.JsType;
  * The JS host only owns the DOM, timers and the network, and calls back in through this class.
  *
  * <p>Invariant: {@code shadow} is the document the ACK queue believes the user sees
- * (server ∘ inflight ∘ buffer). Every entry point first flushes the editor text into the queue,
- * so a remote op is never applied against stale local state.
+ * (server ∘ inflight ∘ buffer). Every entry point first captures the editor text into the queue's
+ * buffer (without sending), so a remote op is never applied against stale local state. Only the
+ * typing window (2 s pause / 10 s cap) or {@link #flushNow} puts edits on the network.
  */
 @JsType
 public final class OtClient {
@@ -85,39 +86,49 @@ public final class OtClient {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Typing window
+    // Typing window: edits are buffered locally and sent only after a 2 s pause (10 s cap)
     // ------------------------------------------------------------------------------------------
 
     /**
-     * Record an editor input event.
+     * Record an editor input event: the change is diffed into the local buffer immediately, but no
+     * network call happens here. During an IME composition the text is not captured yet.
      *
      * @return absolute time (performance.now() clock) when {@link #maybeFlush} should be called,
      *     or -1 while an IME composition is in progress.
      */
     public double onInput(String editorText, double nowMs, boolean composing) {
+        if (!composing) {
+            capture(editorText);
+        }
         return coalescer.onInput(nowMs, composing);
     }
 
     /**
-     * Timer callback. Flushes if the window policy says so.
+     * Timer callback. Sends the buffered edits if the user paused long enough (or hit the cap).
      *
      * @return the next deadline to re-arm the timer for, or -1 if nothing is pending.
      */
     public double maybeFlush(String editorText, double nowMs) {
         if (coalescer.shouldFlush(nowMs)) {
-            flush(editorText);
+            captureAndSend(editorText);
             return -1;
         }
         return coalescer.nextDeadline();
     }
 
-    /** Forced flush (before applying remote ops, on blur, on initial content). */
+    /** Explicit "send now", bypassing the typing window (e.g. programmatic initial content). */
     public void flushNow(String editorText) {
-        flush(editorText);
+        captureAndSend(editorText);
     }
 
-    private void flush(String editorText) {
+    private void captureAndSend(String editorText) {
         coalescer.onFlushed();
+        capture(editorText);
+        sync.requestSend();
+    }
+
+    /** Diff the editor into the ACK queue's buffer. Never sends and leaves the typing window running. */
+    private void capture(String editorText) {
         String text = editorText == null ? "" : editorText;
         TextOperation op = OperationDiff.diff(shadow, text);
         if (op.isNoop()) {
@@ -132,14 +143,15 @@ public final class OtClient {
     // ------------------------------------------------------------------------------------------
 
     /**
-     * Feed one committed server operation (from SSE or catch-up). Pending keystrokes are flushed
-     * first; if remote ops change the document, {@code render} is called once with the merged
-     * text and the transformed selection.
+     * Feed one committed server operation (from SSE or catch-up). Pending keystrokes are captured
+     * into the buffer first (not sent), so the remote op is transformed against exactly what the
+     * user sees; if the document changes, {@code render} is called once with the merged text and
+     * the transformed selection.
      */
     public void onServerEvent(String editorText, double selectionStart, double selectionEnd,
                               double revision, String author, String clientOpId,
                               Object[] ops, double contentLength) {
-        flush(editorText);
+        capture(editorText);
         selStart = (int) selectionStart;
         selEnd = (int) selectionEnd;
         dirty = false;
@@ -170,7 +182,7 @@ public final class OtClient {
     // Inspector
     // ------------------------------------------------------------------------------------------
 
-    /** "Synchronized" | "AwaitingConfirm" | "AwaitingWithBuffer" | "Resyncing". */
+    /** "Synchronized" | "Buffering" | "AwaitingConfirm" | "AwaitingWithBuffer" | "Resyncing". */
     public String getStateName() {
         return sync.getStateName();
     }
@@ -184,6 +196,7 @@ public final class OtClient {
         TextOperation inflight = sync.getInflight();
         TextOperation buffer = sync.getBuffer();
         return "inflight: " + (inflight == null ? "-" : sync.getInflightId() + " " + inflight)
-                + "\nbuffer:   " + (buffer == null ? "-" : buffer.toString());
+                + "\nbuffer:   " + (buffer == null ? "-" : buffer.toString())
+                + (sync.isSendRequested() ? "  (send on ACK)" : "");
     }
 }

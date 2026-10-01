@@ -1,21 +1,25 @@
 package com.googledocs.ot;
 
 /**
- * Pure time-window policy that batches keystrokes into one operation.
+ * Pure time-window policy that decides when buffered keystrokes are sent as one operation.
  *
  * <p>Holds no timers (the JS host owns setTimeout); it only answers "when should I check next?"
- * and "should I flush now?". A pending window is flushed when:
+ * and "should I send now?". A pending window is sent when:
  * <ul>
- *   <li>the user has been idle for {@code idleMs}, or</li>
- *   <li>the window has been open for {@code maxWindowMs} (continuous typing still ships), and</li>
+ *   <li>the user has paused typing for {@code idleMs} (default 2 s), or</li>
+ *   <li>the window has been open for {@code maxWindowMs} (default 10 s: continuous typing still
+ *       ships, which bounds data loss and request size), and</li>
  *   <li>no IME composition is in progress (never send half-composed characters).</li>
  * </ul>
- * Forced flushes (before applying a remote op, on blur) bypass this policy entirely.
+ * Remote ops never trigger a send: the client only captures pending edits into its buffer so the
+ * remote op can be transformed against them.
  */
 public final class InputCoalescer {
 
-    public static final int DEFAULT_IDLE_MS = 80;
-    public static final int DEFAULT_MAX_WINDOW_MS = 400;
+    /** Send only after the user pauses typing this long. */
+    public static final int DEFAULT_IDLE_MS = 2000;
+    /** Safety cap: continuous typing still sends after this long. */
+    public static final int DEFAULT_MAX_WINDOW_MS = 10000;
 
     private final double idleMs;
     private final double maxWindowMs;
