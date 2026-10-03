@@ -45,7 +45,6 @@ The system features:
 ├── pom.xml                                    # Maven aggregator: ot-core -> web-client -> server
 ├── docker-compose.yml                         # 1-click launch (TODO: build context must move to repo root)
 ├── run-global-demo.sh                         # Launch app + expose via tunnel (requires ot-core installed in ~/.m2)
-├── client/                                    # Stale copy of old static files, unused (to be deleted)
 │
 ├── ot-core/                                   # Shared OT logic: pure Java 11, runs on JVM (server) AND J2CL (browser)
 │   ├── pom.xml                                # No deps besides JUnit; attaches sources jar (J2CL compiles from source)
@@ -105,11 +104,11 @@ The system features:
 │       │   └── resources/
 │       │       ├── application.yml            # Config (ports, rate limits, host binding)
 │       │       └── static/                    # Thin JS renderer: DOM, timers, network I/O only
-│       │           ├── index.html             # App shell; loads js/ot-client.js, server-status.js, api.js, stream.js, app.js (no inline scripts)
+│       │           ├── index.html             # App shell; loads server-status.js, api.js, stream.js, app.js (no inline scripts)
 │       │           ├── index.css              # Modern design system (tokens, dark/light, glassmorphism)
-│       │           ├── app.js                 # Editor events, presence, Inspector (still legacy sync path until OtClient ships)
-│       │           ├── api.js                 # REST client (create, read, POST ops + clientOpId, catch-up); reports network errors
-│       │           ├── stream.js              # SSE listener with 3 s auto-reconnect; reports errors to server-status.js
+│       │           ├── app.js                 # LIVE client: editor events, SSE handling (handleRemoteOperation), single-span rebase, presence, Inspector
+│       │           ├── api.js                 # REST client (create, read, POST single-span op + clientOpId, unused catch-up helper); reports network errors
+│       │           ├── stream.js              # SSE EventSource with 3 s auto-reconnect; dispatches to app.js callbacks; reports errors to server-status.js
 │       │           └── server-status.js       # Health polling, "Server is down" screen, reload on recovery / restart
 │       └── test/
 │           └── java/com/googledocs/
@@ -119,7 +118,7 @@ The system features:
 │               └── DocumentServiceTest.java   # Create/read + 10-thread concurrent insert test
 ```
 
-> Once it builds, the J2CL bundle `static/js/ot-client.js` is packaged inside the `web-client` jar. Spring serves it from `classpath:/static/` alongside the renderer files, so the server needs no extra config. Until then, `/js/ot-client.js` falls back to `index.html` and the browser refuses to execute it (`nosniff`), which is harmless.
+> Once it builds, the J2CL bundle `static/js/ot-client.js` is packaged inside the `web-client` jar. Spring serves it from `classpath:/static/` alongside the renderer files. Wiring it in requires: adding `web-client` as a server dependency, re-adding `<script src="/js/ot-client.js">` to `index.html` (removed while the bundle doesn't exist, since the SPA fallback served `index.html` in its place), and switching `app.js` to `window.OtClient`.
 
 ---
 
@@ -200,8 +199,8 @@ When users collaborate globally across continents (e.g. US to Europe or Asia), n
      render R'' ; inflight := A' ; buffer := B'
      ```
    - **ACK = SSE echo**: the server broadcasts every committed op while holding the document write lock, so the SSE stream is totally ordered by revision. The client processes events strictly in revision order (a reorder buffer of up to 256 events absorbs any out-of-order delivery). An event carrying its own `authorSessionId` + in-flight `clientOpId` is the ACK; the client then sends the buffer with `baseRevision = revision`. Everything else is a remote op.
-   - **Failure handling**: an HTTP error on send, a revision gap that exceeds the reorder buffer, or a `contentLength` mismatch triggers a **resync**: the client reloads the snapshot. Unsent local edits are currently discarded on resync (`TODO`: re-diff them on top of the new snapshot). After an SSE reconnect, the client fetches `?sinceRevision=` to catch up. Each `OtClient` instance uses a unique `clientOpId` prefix so ids never collide across resyncs.
-   - *Status*: implemented and tested on the JVM (`ClientSyncStateTest`, `OtEndToEndTest`). It reaches the browser only once the J2CL bundle builds. Until then `app.js` uses the legacy path, which overwrites the textarea with the server's `content` on every remote op, so keystrokes typed during a round trip can be lost.
+   - **Failure handling**: an HTTP error on send, a revision gap that exceeds the reorder buffer, or a `contentLength` mismatch triggers a **resync**: the client reloads the snapshot. Unsent local edits are currently discarded on resync (`TODO`: re-diff them on top of the new snapshot). After an SSE reconnect, the client should fetch `?sinceRevision=` to catch up (`TODO`: neither `OtClient` nor the live `app.js` does this yet; `Api.getOperationsSince` exists but is never called). Each `OtClient` instance uses a unique `clientOpId` prefix so ids never collide across resyncs.
+   - *Status*: implemented and tested on the JVM (`ClientSyncStateTest`, `OtEndToEndTest`). It reaches the browser only once the J2CL bundle builds. Until then the browser receives SSE in `static/stream.js` → `app.js` `handleRemoteOperation`, which takes the event's full `content` as server truth, treats a matching `clientOpId` as its ACK, and rebases unsent typing with single-span helpers (`remoteSpan` / `transformSpan`).
    - *Scope*: the ACK queue runs for OT documents. CRDT documents keep a simple one-op-in-flight path (`TODO(crdt-client)`), since CRDT position IDs make them order-independent anyway.
 3. **Input Coalescing Window (Keystroke → Operation)**:
    - The JS renderer forwards every `input` event to the J2CL client (`InputCoalescer` + `OperationDiff`). Each keystroke is diffed into the local **buffer** immediately (no network call). The buffer is sent as one `TextOperation` only when:

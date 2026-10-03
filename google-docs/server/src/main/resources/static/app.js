@@ -27,15 +27,9 @@
   let inflight = null;        // { clientOpId, op } waiting for its SSE echo
   let sendRequested = false;  // a pause was reached while an op was in flight: send on ACK
   let opCounter = 0;
+  let flushTimer = null;      // pending typing-pause send
+  let composing = false;      // IME composition in progress: never send a half-composed char
   const instanceId = Math.random().toString(36).slice(2, 10);
-
-  // J2CL client core (OT documents). The Java side owns the typing window, the ACK queue and
-  // remote-op merging; this file only renders, runs timers and talks to the network.
-  let otClient = null;
-  let flushTimer = null;
-  let composing = false;
-  let queuedServerEvents = [];
-  let resyncing = false;
 
   // DOM Elements
   const docTitleEl = document.getElementById('docTitle');

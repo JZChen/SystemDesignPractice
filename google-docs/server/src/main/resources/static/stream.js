@@ -47,7 +47,8 @@ class SyncStream {
         this.retryTimeout = setTimeout(() => this.connect(), 3000);
       };
     } catch (err) {
-      console.warn('SSE connection failed, falling back to polling if needed');
+      console.warn('SSE connection failed; retrying in 3 s', err);
+      this.retryTimeout = setTimeout(() => this.connect(), 3000);
     }
   }
 
