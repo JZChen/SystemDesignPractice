@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Collab Canvas</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/js/app.js"></script>
+</head>
+<body>
+  <header class="toolbar">
+    <span class="brand">Collab Canvas</span>
+    <div class="group board-only" role="toolbar" aria-label="Tools">
+      <button type="button" data-tool="select" title="Select / move (V)">Select</button>
+      <button type="button" data-tool="pen" title="Pen (P)">Pen</button>
+      <button type="button" data-tool="rect" title="Rectangle (R)">Rect</button>
+      <button type="button" data-tool="ellipse" title="Ellipse (O)">Ellipse</button>
+      <button type="button" data-tool="line" title="Line (L)">Line</button>
+      <button type="button" data-tool="arrow" title="Arrow (A)">Arrow</button>
+      <button type="button" data-tool="eraser" title="Eraser (E)">Eraser</button>
+    </div>
+    <div class="group board-only">
+      <label title="Stroke color">Stroke <input type="color" id="stroke-color" value="#1f2937"></label>
+      <label title="Stroke width">Width <input type="range" id="stroke-width" min="1" max="20" value="3"></label>
+      <label title="Fill rectangles and ellipses"><input type="checkbox" id="fill-on"> Fill</label>
+      <input type="color" id="fill-color" value="#fde68a" title="Fill color">
+    </div>
+    <div class="group board-only">
+      <button type="button" id="undo" title="Undo (Cmd/Ctrl+Z)">Undo</button>
+      <button type="button" id="redo" title="Redo (Shift+Cmd/Ctrl+Z)">Redo</button>
+      <button type="button" id="copy-link" title="Copy the board link">Copy link</button>
+    </div>
+    <div class="spacer"></div>
+    <div id="avatars" class="avatars board-only" aria-label="People on this board"></div>
+    <span id="pending" class="pending board-only"></span>
+    <span id="status" class="status" role="status" aria-live="polite"></span>
+  </header>
+
+  <p id="missing" class="missing" hidden>
+    <a href="/">Create a new board</a>
+  </p>
+
+  <main id="stage" class="stage board-only">
+    <canvas id="canvas"></canvas>
+    <div id="scroller" class="scroller">
+      <div class="board-size"></div>
+    </div>
+  </main>
+</body>
+</html>

@@ -1,0 +1,19 @@
+server:
+  port: ${SERVER_PORT:8090}
+  address: ${SERVER_HOST:127.0.0.1}   # TODO(security): set SERVER_HOST=0.0.0.0 only behind a TLS tunnel/proxy
+  error:
+    include-stacktrace: never
+    include-message: never
+
+spring:
+  application:
+    name: collab-canvas
+  threads:
+    virtual:
+      enabled: true
+
+app:
+  # WebSocket handshake Origin allow-list (comma-separated, no wildcards). Add your tunnel URL here.
+  allowed-origins: ${ALLOWED_ORIGINS:http://127.0.0.1:8090,http://localhost:8090}
+  rate-limit:
+    requests-per-minute: 120
